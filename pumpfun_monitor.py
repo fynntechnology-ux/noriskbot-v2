@@ -68,16 +68,14 @@ class TokenWatch:
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
                  "vtoken_raw", "accounts", "ata_created",
-                 "last_dashboard_update", "creator_pubkey")
+                 "last_dashboard_update")
 
-    def __init__(self, mint: str, symbol: str, name: str, created_at: float,
-                 creator_pubkey: str = ""):
-        self.mint           = mint
-        self.symbol         = symbol
-        self.name           = name
-        self.created_at     = created_at
-        self.creator_pubkey = creator_pubkey
-        self.vsol           = VSOL_INIT
+    def __init__(self, mint: str, symbol: str, name: str, created_at: float):
+        self.mint         = mint
+        self.symbol       = symbol
+        self.name         = name
+        self.created_at   = created_at
+        self.vsol         = VSOL_INIT
         self.peak_vsol      = VSOL_INIT
         self.had_activity   = False
         self.vtoken_raw:  int | None           = None
@@ -305,11 +303,9 @@ class PumpFunMonitor:
             log.debug("Stale event %s (age=%.0fs) — skipping", mint[:8], age)
             return
 
-        creator_pubkey = msg.get("traderPublicKey", "")
-        log.info("Tracking  %s  sym=%s  name=%s  creator=%s",
-                 mint, symbol, name, creator_pubkey[:8] if creator_pubkey else "?")
+        log.info("Tracking  %s  sym=%s  name=%s", mint, symbol, name)
 
-        watch = TokenWatch(mint, symbol, name, created_at, creator_pubkey)
+        watch = TokenWatch(mint, symbol, name, created_at)
         if "vSolInBondingCurve" in msg:
             watch.vsol      = float(msg["vSolInBondingCurve"])
             watch.peak_vsol = watch.vsol
