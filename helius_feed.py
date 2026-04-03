@@ -4,7 +4,9 @@ Helius Gatekeeper RPC — accountSubscribe feed.
 Maintains a single persistent WebSocket and multiplexes accountSubscribe
 requests for pump.fun bonding curve accounts.
 
-Callback: on_update(mint: str, vsol: float)  — vsol in SOL
+Callback: on_update(mint: str, vsol: float, vtoken_raw: int)
+  vsol       — virtual SOL reserves in SOL (float)
+  vtoken_raw — virtual token reserves in raw u64 lamports
 """
 
 import asyncio
@@ -24,15 +26,19 @@ log = get_logger("helius")
 #   [0:8]   discriminator
 #   [8:16]  virtualTokenReserves  (u64 LE)
 #   [16:24] virtualSolReserves    (u64 LE)  ← vSolInBondingCurve in lamports
-_VSOL_OFFSET = 16
+_VTOKEN_OFFSET = 8
+_VSOL_OFFSET   = 16
 
 
-def _parse_vsol(data_b64: str) -> float | None:
+def _parse_reserves(data_b64: str) -> tuple[float, int] | None:
+    """Returns (vsol_float, vtoken_raw_int) or None on parse failure."""
     try:
         data = base64.b64decode(data_b64)
         if len(data) < 24:
             return None
-        return struct.unpack_from("<Q", data, _VSOL_OFFSET)[0] / 1e9
+        vtoken_raw = struct.unpack_from("<Q", data, _VTOKEN_OFFSET)[0]
+        vsol       = struct.unpack_from("<Q", data, _VSOL_OFFSET)[0] / 1e9
+        return vsol, vtoken_raw
     except Exception:
         return None
 
@@ -43,7 +49,7 @@ class HeliusAccountFeed:
     Call subscribe(mint, bonding_curve_address) to track a token.
     """
 
-    def __init__(self, on_update: Callable[[str, float], None]):
+    def __init__(self, on_update: Callable[[str, float, int], None]):
         self._on_update    = on_update
         self._ws           = None
         self._req_id       = 1
@@ -169,6 +175,7 @@ class HeliusAccountFeed:
         data_list = params.get("result", {}).get("value", {}).get("data")
         if not isinstance(data_list, list) or not data_list:
             return
-        vsol = _parse_vsol(data_list[0])
-        if vsol is not None:
-            self._on_update(mint, vsol)
+        reserves = _parse_reserves(data_list[0])
+        if reserves is not None:
+            vsol, vtoken_raw = reserves
+            self._on_update(mint, vsol, vtoken_raw)

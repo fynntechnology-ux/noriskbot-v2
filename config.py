@@ -15,8 +15,9 @@ SLIPPAGE:                float = float(os.getenv("SLIPPAGE", "0.5"))
 MAX_CONCURRENT_POSITIONS:int   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 
 # Solana transaction fees
-COMPUTE_UNIT_LIMIT: int = int(os.getenv("COMPUTE_UNIT_LIMIT", "200000"))
-COMPUTE_UNIT_PRICE: int = int(os.getenv("COMPUTE_UNIT_PRICE", "500000"))  # micro-lamports/CU
+COMPUTE_UNIT_LIMIT:   int = int(os.getenv("COMPUTE_UNIT_LIMIT",   "200000"))
+COMPUTE_UNIT_PRICE:   int = int(os.getenv("COMPUTE_UNIT_PRICE",   "500000"))  # micro-lamports/CU
+SENDER_TIP_LAMPORTS:  int = int(os.getenv("SENDER_TIP_LAMPORTS",  "200000"))  # 0.0002 SOL
 
 # RPC endpoints
 HELIUS_RPC_HTTP:   str = "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"

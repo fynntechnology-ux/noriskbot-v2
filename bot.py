@@ -55,7 +55,13 @@ class PumpSnipeBot:
             log.info("Buying  %s  (age=%.1fs)", mint, signal["age_seconds"])
 
             try:
-                order_id = await self._solana.buy(mint, config.BUY_AMOUNT_SOL)
+                order_id = await self._solana.buy(
+                    mint_str       = mint,
+                    sol_amount     = config.BUY_AMOUNT_SOL,
+                    token_accounts = signal.get("token_accounts"),
+                    vsol_lamports  = signal.get("vsol_lamports"),
+                    vtoken_raw     = signal.get("vtoken_raw"),
+                )
                 # Open position + start sell timer immediately — don't wait for
                 # on-chain confirmation (saves 1-5s). Buy confirms well within
                 # the 60s hold window; sell_all handles empty balance gracefully.
@@ -93,7 +99,7 @@ class PumpSnipeBot:
         log.info("  trigger       : 0.0%% bonding curve (everyone sold out)")
         log.info("  slippage      : %.0f%%", config.SLIPPAGE * 100)
         log.info("  cu price      : %d micro-lamports/CU", config.COMPUTE_UNIT_PRICE)
-        log.info("  jito tip      : %d lamports  (enabled=%s)", config.JITO_TIP_LAMPORTS, config.USE_JITO)
+        log.info("  sender tip    : %d lamports", config.SENDER_TIP_LAMPORTS)
         log.info("  max positions : %d", config.MAX_CONCURRENT_POSITIONS)
         log.info("=" * 60)
 

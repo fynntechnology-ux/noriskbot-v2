@@ -30,6 +30,7 @@ from solders.pubkey import Pubkey
 
 import config
 from helius_feed import HeliusAccountFeed
+from solana_client import TokenAccounts
 from state import BotState
 from logger import get_logger
 
@@ -61,10 +62,12 @@ def _progress(vsol: float) -> float:
     return max(0.0, min((vsol - VSOL_INIT) / (VSOL_MAX - VSOL_INIT) * 100, 100.0))
 
 
+
 class TokenWatch:
     """Per-token state tracked from account updates."""
     __slots__ = ("mint", "symbol", "name", "created_at",
-                 "vsol", "peak_vsol", "had_activity")
+                 "vsol", "peak_vsol", "had_activity",
+                 "vtoken_raw", "accounts")
 
     def __init__(self, mint: str, symbol: str, name: str, created_at: float):
         self.mint         = mint
@@ -74,24 +77,28 @@ class TokenWatch:
         self.vsol         = VSOL_INIT
         self.peak_vsol    = VSOL_INIT
         self.had_activity = False
+        self.vtoken_raw: int | None           = None
+        self.accounts:   TokenAccounts | None = None
 
 
 class PumpFunMonitor:
     def __init__(self, on_signal: TokenCallback, solana_client, state: BotState):
-        self._on_signal = on_signal
-        self._state     = state
+        self._on_signal      = on_signal
+        self._state          = state
+        self._solana_client  = solana_client
         self._watching: dict[str, TokenWatch] = {}
-        self._ws        = None
-        self._helius    = HeliusAccountFeed(on_update=self._on_helius_update)
+        self._ws             = None
+        self._helius         = HeliusAccountFeed(on_update=self._on_helius_update)
 
     # ------------------------------------------------------------------
     # VSol processing — called by both PumpPortal trades and Helius feed
     # ------------------------------------------------------------------
 
-    def _on_helius_update(self, mint: str, vsol: float):
-        """Called by HeliusAccountFeed with parsed vSol value."""
+    def _on_helius_update(self, mint: str, vsol: float, vtoken_raw: int):
+        """Called by HeliusAccountFeed with parsed reserves."""
         watch = self._watching.get(mint)
         if watch:
+            watch.vtoken_raw = vtoken_raw
             self._process_vsol(watch, vsol)
 
     def _on_trade(self, msg: dict):
@@ -104,6 +111,27 @@ class PumpFunMonitor:
         if vsol_raw is None:
             return
         self._process_vsol(watch, float(vsol_raw))
+
+    async def _prefetch_accounts(self, mint: str):
+        """
+        Call PumpPortal trade-local for a dummy buy to obtain the static account
+        list for this token, then cache it on the TokenWatch.
+
+        Accounts extracted from the static list (indices into the non-ALT portion):
+          [1] assoc_user          — user's token ATA
+          [2] bonding_curve       — bonding curve PDA
+          [3] assoc_bonding_curve — bonding curve's ATA
+          [4] creator_vault       — creator vault PDA
+          [6] unk16               — FLASHX8 per-token account
+        """
+        try:
+            accounts = await self._solana_client.prefetch_token_accounts(mint)
+            watch = self._watching.get(mint)
+            if watch and accounts:
+                watch.accounts = accounts
+                log.debug("%s  accounts prefetched", mint[:8])
+        except Exception as exc:
+            log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
 
     def _process_vsol(self, watch: TokenWatch, vsol: float):
         """Core signal logic — idempotent, safe to call from multiple feeds."""
@@ -156,6 +184,10 @@ class PumpFunMonitor:
             "bonding_pct":      0.0,
             "peak_bonding_pct": peak_pct,
             "age_seconds":      age,
+            # Per-token data for local tx building (may be None if prefetch lost race)
+            "vsol_lamports":    int(watch.vsol * 1e9),
+            "vtoken_raw":       watch.vtoken_raw,
+            "token_accounts":   watch.accounts,
         })
 
     # ------------------------------------------------------------------
@@ -251,6 +283,9 @@ class PumpFunMonitor:
 
         self._state.track_token(mint, symbol, name, created_at)
         self._state.log("launch", mint, symbol, f"new token  age={age:.1f}s")
+
+        # Prefetch per-token accounts in background (needed for local tx building)
+        asyncio.create_task(self._prefetch_accounts(mint))
 
         # Subscribe on Helius for fast account-level updates
         try:
