@@ -382,7 +382,7 @@ class SolanaClient:
           5. pump.fun buy
 
         AMM pricing:
-          tokens_out = sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
+          tokens_out = expected_tokens * (1 - slippage)  — minimum acceptable, tolerates stale vSol
           max_sol_cost = sol_lamports * (1 + slippage)
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
@@ -417,7 +417,10 @@ class SolanaClient:
         )
 
         # ── 4. pump.fun buy ────────────────────────────────────────────────────
-        tokens_out   = sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
+        # tokens_out: expected AMM output, reduced by slippage so it's a true
+        # minimum acceptable amount — handles vSol drift between signal and execution
+        tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
+                           * (1 - config.SLIPPAGE))
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
         slippage_bps = int(config.SLIPPAGE * 100)
 
