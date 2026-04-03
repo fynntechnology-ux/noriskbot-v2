@@ -283,7 +283,12 @@ class SolanaClient:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
-        return done.pop().result()
+        # Return first SUCCESS — if first completion was an exception, try others
+        for t in done:
+            if not t.exception():
+                return t.result()
+        # All completed tasks failed — re-raise the first exception
+        raise done.pop().exception()
 
     # ── PumpPortal unsigned transaction builder ──────────────────────────────
 
