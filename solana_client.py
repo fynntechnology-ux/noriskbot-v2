@@ -586,28 +586,29 @@ class SolanaClient:
                 and vtoken_raw > 0
                 and vsol_lamports > 0):
             try:
-                # Derive creator_vault PDA from seeds ["vault", creator_pubkey, mint]
-                # to avoid relying on static[4] from prefetch tx (wrong since pump.fun update)
-                if creator_pubkey:
-                    try:
-                        creator_pk = Pubkey.from_string(creator_pubkey)
-                        mint_pk    = Pubkey.from_string(mint_str)
-                        vault_pda, _ = Pubkey.find_program_address(
-                            [b"vault", bytes(creator_pk), bytes(mint_pk)],
-                            _PUMP_OLD_PROG,
-                        )
-                        token_accounts = TokenAccounts(
-                            assoc_user          = token_accounts.assoc_user,
-                            bonding_curve       = token_accounts.bonding_curve,
-                            assoc_bonding_curve = token_accounts.assoc_bonding_curve,
-                            creator_vault       = str(vault_pda),
-                            pump_const1         = token_accounts.pump_const1,
-                            unk16               = token_accounts.unk16,
-                        )
-                        log.debug("creator_vault derived: %s", str(vault_pda))
-                    except Exception as exc:
-                        log.warning("creator_vault PDA derivation failed for %s: %s",
-                                    mint_str[:8], exc)
+                # creator_pubkey is required to derive the correct creator_vault PDA.
+                # Without it, static[4] from the prefetch tx is wrong (pump.fun update)
+                # and the tx will hit Custom:2006 — force fallback instead.
+                if not creator_pubkey:
+                    log.warning("creator_pubkey missing for %s — falling back to PumpPortal",
+                                mint_str[:8])
+                    raise ValueError("creator_pubkey required for local build")
+
+                creator_pk = Pubkey.from_string(creator_pubkey)
+                mint_pk    = Pubkey.from_string(mint_str)
+                vault_pda, _ = Pubkey.find_program_address(
+                    [b"vault", bytes(creator_pk), bytes(mint_pk)],
+                    _PUMP_OLD_PROG,
+                )
+                token_accounts = TokenAccounts(
+                    assoc_user          = token_accounts.assoc_user,
+                    bonding_curve       = token_accounts.bonding_curve,
+                    assoc_bonding_curve = token_accounts.assoc_bonding_curve,
+                    creator_vault       = str(vault_pda),
+                    pump_const1         = token_accounts.pump_const1,
+                    unk16               = token_accounts.unk16,
+                )
+                log.debug("creator_vault derived: %s", str(vault_pda))
 
                 blockhash = await self._fresh_blockhash()
                 tx_bytes  = self._build_local_buy_tx(
