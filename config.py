@@ -23,7 +23,7 @@ MIN_BUY_BUFFER_LAMPORTS:  int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",  "30000
 # RPC endpoints
 HELIUS_RPC_HTTP:   str = "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
 HELIUS_RPC_WS:     str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-HELIUS_SENDER_URL: str = "https://ams-sender.helius-rpc.com/fast"
+HELIUS_SENDER_URL: str = "http://ams-sender.helius-rpc.com/fast"
 
 # PumpPortal WebSocket for new token events
 PUMPPORTAL_WS: str = "wss://pumpportal.fun/api/data"
