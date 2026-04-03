@@ -76,7 +76,9 @@ class SolanaClient:
         connector = aiohttp.TCPConnector(
             limit=20, ttl_dns_cache=300, enable_cleanup_closed=True,
         )
-        self._session = aiohttp.ClientSession(connector=connector)
+        self._session       = aiohttp.ClientSession(connector=connector)
+        self._blockhash     = ""
+        self._blockhash_ts  = 0.0
         log.info("Wallet: %s", self._pubkey)
 
     async def close(self):
@@ -84,7 +86,7 @@ class SolanaClient:
             await self._session.close()
 
     async def warmup(self):
-        """Pre-warm TCP connections to all endpoints before the first trade."""
+        """Pre-warm TCP connections and prime the blockhash cache."""
         async def _warm_helius():
             try:
                 await self._rpc({"method": "getHealth"})
@@ -104,7 +106,36 @@ class SolanaClient:
                 pass  # expected to fail — we just want the connection open
             log.info("PumpPortal connection warmed up")
 
-        await asyncio.gather(_warm_helius(), _warm_pumpportal())
+        async def _prime_blockhash():
+            try:
+                self._blockhash    = await self._get_blockhash()
+                self._blockhash_ts = time.time()
+                log.info("Blockhash primed: %s…", self._blockhash[:12])
+            except Exception as exc:
+                log.warning("Blockhash prime failed: %s", exc)
+
+        await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash())
+        asyncio.create_task(self._blockhash_refresher())
+
+    async def _blockhash_refresher(self):
+        """Background task: keep blockhash ≤300ms old."""
+        while True:
+            await asyncio.sleep(0.3)
+            try:
+                self._blockhash    = await self._get_blockhash()
+                self._blockhash_ts = time.time()
+            except Exception as exc:
+                log.warning("Blockhash refresh failed: %s", exc)
+
+    async def _fresh_blockhash(self) -> str:
+        """Return cached blockhash if ≤400ms old, else fetch synchronously."""
+        if time.time() - self._blockhash_ts <= 0.4 and self._blockhash:
+            return self._blockhash
+        log.warning("Blockhash cache stale — fetching now")
+        bh = await self._get_blockhash()
+        self._blockhash    = bh
+        self._blockhash_ts = time.time()
+        return bh
 
     # ── RPC ──────────────────────────────────────────────────────────────────
 
@@ -399,7 +430,7 @@ class SolanaClient:
                 and vtoken_raw > 0
                 and vsol_lamports > 0):
             try:
-                blockhash = await self._get_blockhash()
+                blockhash = await self._fresh_blockhash()
                 tx_bytes  = self._build_local_buy_tx(
                     mint_str      = mint_str,
                     accounts      = token_accounts,
