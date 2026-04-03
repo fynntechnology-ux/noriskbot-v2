@@ -407,7 +407,6 @@ class SolanaClient:
         vtoken_raw:   int,
         vsol_lamports: int,
         blockhash:    str,
-        ata_created:  bool = False,
     ) -> bytes:
         """
         Build and sign a pump.fun buy transaction locally.
@@ -511,11 +510,9 @@ class SolanaClient:
             data=bytes(buy_data),
         )
 
-        ixs = [ix_cu_limit, ix_cu_price, ix_tip, ix_buy] if ata_created else \
-              [ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy]
         msg = MessageV0.try_compile(
             payer=self._pubkey,
-            instructions=ixs,
+            instructions=[ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
             address_lookup_table_accounts=[self._pump_alt],
             recent_blockhash=Hash.from_string(blockhash),
         )
@@ -531,7 +528,6 @@ class SolanaClient:
         token_accounts: "TokenAccounts | None" = None,
         vsol_lamports: int | None           = None,
         vtoken_raw:    int | None           = None,
-        ata_created:   bool                 = False,
     ) -> str:
         log.info("BUY  %s  %.4f SOL", mint_str, sol_amount)
 
@@ -553,7 +549,6 @@ class SolanaClient:
                     vtoken_raw    = vtoken_raw,
                     vsol_lamports = vsol_lamports,
                     blockhash     = blockhash,
-                    ata_created   = ata_created,
                 )
                 tx_b64 = base64.b64encode(tx_bytes).decode()
                 sig    = await self._send_via_sender(tx_b64)

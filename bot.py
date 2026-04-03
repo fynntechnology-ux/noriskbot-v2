@@ -72,7 +72,6 @@ class PumpSnipeBot:
                     token_accounts = signal.get("token_accounts"),
                     vsol_lamports  = signal.get("vsol_lamports"),
                     vtoken_raw     = signal.get("vtoken_raw"),
-                    ata_created    = signal.get("ata_created", False),
                 )
                 # Open position + start sell timer immediately — don't wait for
                 # on-chain confirmation (saves 1-5s). Buy confirms well within
