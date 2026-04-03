@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+import config
 from state import BotState
 
 DASHBOARD_HTML = Path(__file__).parent / "templates" / "index.html"
@@ -61,7 +62,7 @@ def serialize(state: BotState) -> dict:
                 "name":          p.name,
                 "bought_at":     p.bought_at,
                 "age_s":         round(now - p.bought_at, 1),
-                "sell_in_s":     max(0, round(60 - (now - p.bought_at), 1)),
+                "sell_in_s":     max(0, round(config.HOLD_TIME_SECONDS - (now - p.bought_at), 1)),
                 "sol_spent":     p.sol_spent,
                 "bonding_at_buy": round(p.bonding_at_buy, 4),
                 "peak_bonding":  round(p.peak_bonding, 4),
