@@ -110,6 +110,11 @@ class PumpFunMonitor:
         vsol_raw = msg.get("vSolInBondingCurve")
         if vsol_raw is None:
             return
+        # Also capture vtoken so local build doesn't fall back when only
+        # the PumpPortal feed fires before the Helius subscription arrives
+        vtoken_raw = msg.get("vTokensInBondingCurve")
+        if vtoken_raw is not None and watch.vtoken_raw is None:
+            watch.vtoken_raw = int(vtoken_raw)
         self._process_vsol(watch, float(vsol_raw))
 
     async def _prefetch_accounts(self, mint: str):
