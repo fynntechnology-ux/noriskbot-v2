@@ -21,7 +21,7 @@ class PumpSnipeBot:
         self._positions = PositionManager(self._solana, state)
         self._monitor = PumpFunMonitor(
             on_signal=self._on_signal,
-            gmgn_client=self._solana,
+            solana_client=self._solana,
             state=state,
         )
         self._buy_lock = asyncio.Semaphore(config.MAX_CONCURRENT_POSITIONS)

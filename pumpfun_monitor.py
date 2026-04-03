@@ -77,9 +77,8 @@ class TokenWatch:
 
 
 class PumpFunMonitor:
-    def __init__(self, on_signal: TokenCallback, gmgn_client, state: BotState):
+    def __init__(self, on_signal: TokenCallback, solana_client, state: BotState):
         self._on_signal = on_signal
-        self._gmgn      = gmgn_client
         self._state     = state
         self._watching: dict[str, TokenWatch] = {}
         self._ws        = None
