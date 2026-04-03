@@ -195,6 +195,8 @@ class PumpFunMonitor:
             asyncio.create_task(self._fire(watch, age, peak_pct))
 
     async def _fire(self, watch: TokenWatch, age: float, peak_pct: float):
+        # Use watch.vsol at fire time — fresher than signal-moment snapshot
+        # since Helius may have updated it between signal detection and here
         await self._on_signal({
             "mint":             watch.mint,
             "symbol":           watch.symbol,
@@ -315,19 +317,22 @@ class PumpFunMonitor:
         # Prefetch per-token accounts in background (needed for local tx building)
         asyncio.create_task(self._prefetch_accounts(mint))
 
-        # Subscribe on Helius for fast account-level updates
-        try:
-            # Use bondingCurveKey from PumpPortal if provided, else derive it
-            bc_addr = msg.get("bondingCurveKey") or _derive_bonding_curve(mint)
-            await self._helius.subscribe(mint, bc_addr)
-        except Exception as exc:
-            log.warning("Helius subscribe failed for %s: %s", mint[:8], exc)
+        # Subscribe Helius + PumpPortal trade in parallel
+        bc_addr = msg.get("bondingCurveKey") or _derive_bonding_curve(mint)
 
-        # Also subscribe on PumpPortal as backup
-        if self._ws:
+        async def _helius_sub():
             try:
-                await self._ws.send(json.dumps(
-                    {"method": "subscribeTokenTrade", "keys": [mint]}
-                ))
+                await self._helius.subscribe(mint, bc_addr)
             except Exception as exc:
-                log.warning("PumpPortal trade subscribe failed for %s: %s", mint[:8], exc)
+                log.warning("Helius subscribe failed for %s: %s", mint[:8], exc)
+
+        async def _pp_trade_sub():
+            if self._ws:
+                try:
+                    await self._ws.send(json.dumps(
+                        {"method": "subscribeTokenTrade", "keys": [mint]}
+                    ))
+                except Exception as exc:
+                    log.warning("PumpPortal trade subscribe failed for %s: %s", mint[:8], exc)
+
+        await asyncio.gather(_helius_sub(), _pp_trade_sub())
