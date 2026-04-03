@@ -41,7 +41,6 @@ _GLOBAL           = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5zXDFQLa3s9
 _FEE_RECIPIENT    = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnkwbGEHBKHsvCb4RRTMGU")
 _EVENT_AUTHORITY  = Pubkey.from_string("Ce6TQqeH3go77A8dz3FPRp1MTEFGYZiQAzRoXH3MRBkS")
 _PUMP_PDA         = Pubkey.from_string("Hq2wp8uQPApxkjFKuvYQBBqjkRqQmvBBs9dEHRfN9Cmb")
-_PUMP_CONST1      = Pubkey.from_string("63EDqM8e3hWmPYqo6s29SKLXEU7fKFEZVoFgkS7bvveq")
 _PUMP_CONST2      = Pubkey.from_string("8Wf5TiA9KN2FLGE1PJp1UyeCpMWP4r1C12fKHxvLkFDL")
 _PFEE_CONST       = Pubkey.from_string("7FeFBYb5FWAS8KwxT1CUZ3K3UyCnFbJTa2bsTq3QjYNW")
 
@@ -52,8 +51,8 @@ _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA
 _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 _SYSVAR_RENT      = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
-# Helius Sender tip recipient (used when submitting via ams-sender)
-_HELIUS_TIP       = Pubkey.from_string("DAxtZFEZCMjELH2GzbFbMBX11wRRqkpRiXUBmPiWVbj9")
+# Helius Sender tip recipient — must be one of the addresses Sender accepts
+_HELIUS_TIP       = Pubkey.from_string("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey")
 
 # Buy instruction discriminator (8 bytes)
 _BUY_DISC = bytes([0x66, 0x32, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
@@ -62,11 +61,12 @@ _BUY_DISC = bytes([0x66, 0x32, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
 @dataclass
 class TokenAccounts:
     """Per-token on-chain accounts needed to build the buy instruction locally."""
-    assoc_user:          str
-    bonding_curve:       str
-    assoc_bonding_curve: str
-    creator_vault:       str
-    unk16:               str
+    assoc_user:          str  # static[1] → buy slot[ 5]
+    bonding_curve:       str  # static[2] → buy slot[ 3]
+    assoc_bonding_curve: str  # static[3] → buy slot[ 4]
+    creator_vault:       str  # static[4] → buy slot[ 9]
+    pump_const1:         str  # static[5] → buy slot[13] — per-token, NOT a global constant
+    unk16:               str  # static[6] → buy slot[16]
 
 
 class SolanaClient:
@@ -194,6 +194,18 @@ class SolanaClient:
                 return raw, ui
         return 0, 0.0
 
+    async def _send_via_rpc(self, tx_b64: str) -> str:
+        """Submit via regular Helius RPC (no tip requirement, lower priority)."""
+        result = await self._rpc({
+            "method": "sendTransaction",
+            "params": [tx_b64, {
+                "encoding":      "base64",
+                "skipPreflight": True,
+                "maxRetries":    0,
+            }],
+        }, timeout=5)
+        return result
+
     async def _send_via_sender(self, tx_b64: str) -> str:
         """Submit via Helius Sender — staked connection, priority inclusion."""
         async with self._session.post(
@@ -212,8 +224,11 @@ class SolanaClient:
             timeout=aiohttp.ClientTimeout(total=2),
         ) as resp:
             data = await resp.json(content_type=None)
+        log.debug("Sender response (status=%d): %s", resp.status, data)
         if "error" in data:
             raise RuntimeError(f"Sender error: {data['error']}")
+        if "result" not in data:
+            raise RuntimeError(f"Sender unexpected response: {data}")
         return data["result"]
 
     # ── PumpPortal unsigned transaction builder ──────────────────────────────
@@ -288,6 +303,7 @@ class SolanaClient:
                 bonding_curve       = str(static[2]),
                 assoc_bonding_curve = str(static[3]),
                 creator_vault       = str(static[4]),
+                pump_const1         = str(static[5]),
                 unk16               = str(static[6]),
             )
         except Exception as exc:
@@ -370,10 +386,11 @@ class SolanaClient:
             + struct.pack("<H", slippage_u16)
         )
 
-        bc    = Pubkey.from_string(accounts.bonding_curve)
-        abc   = Pubkey.from_string(accounts.assoc_bonding_curve)
-        cvlt  = Pubkey.from_string(accounts.creator_vault)
-        unk16 = Pubkey.from_string(accounts.unk16)
+        bc          = Pubkey.from_string(accounts.bonding_curve)
+        abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
+        cvlt        = Pubkey.from_string(accounts.creator_vault)
+        pump_const1 = Pubkey.from_string(accounts.pump_const1)
+        unk16       = Pubkey.from_string(accounts.unk16)
 
         ix_buy = Instruction(
             program_id=_PUMP_NEW_PROG,
@@ -391,7 +408,7 @@ class SolanaClient:
                 AccountMeta(_EVENT_AUTHORITY, False, False),  # [10]
                 AccountMeta(_PUMP_OLD_PROG,   False, False),  # [11]
                 AccountMeta(_PUMP_PDA,        False, False),  # [12]
-                AccountMeta(_PUMP_CONST1,     False, True),   # [13]
+                AccountMeta(pump_const1,      False, True),   # [13] per-token, from prefetch
                 AccountMeta(_PUMP_CONST2,     False, False),  # [14]
                 AccountMeta(_PFEE_PROG,       False, False),  # [15]
                 AccountMeta(unk16,            False, True),   # [16]
@@ -463,7 +480,8 @@ class SolanaClient:
         unsigned_tx = await self._get_pump_tx(payload)
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
-        sig = await self._send_via_sender(tx_b64)
+        # PumpPortal txs have no Helius tip — use regular RPC not Sender
+        sig = await self._send_via_rpc(tx_b64)
         log.info("BUY  submitted (pumpportal)  sig=%s", sig)
         return sig
 
@@ -493,7 +511,8 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_via_sender(tx_b64)
+        # PumpPortal txs have no Helius tip — use regular RPC not Sender
+        sig = await self._send_via_rpc(tx_b64)
         log.info("SELL submitted  sig=%s", sig)
         return sig
 
