@@ -84,7 +84,8 @@ class PumpSnipeBot:
                     bonding_at_buy=signal["bonding_pct"],
                     peak_bonding=signal["peak_bonding_pct"],
                 )
-                # Confirm in background — log if it failed
+                # Refresh balance + confirm in background
+                asyncio.create_task(self._solana.refresh_balance())
                 asyncio.create_task(
                     self._confirm_buy(order_id, mint, symbol)
                 )
@@ -95,7 +96,10 @@ class PumpSnipeBot:
 
     async def _confirm_buy(self, order_id: str, mint: str, symbol: str):
         try:
-            await self._solana.wait_for_order(order_id, label="BUY")
+            result = await self._solana.wait_for_order(order_id, label="BUY")
+            actual = result.get("sol_spent", 0)
+            if actual > 0 and mint in self._state.positions:
+                self._state.positions[mint].sol_spent = actual
         except Exception as exc:
             self._state.log("warn", mint, symbol, f"buy confirm failed: {exc}")
             log.warning("Buy confirmation failed for %s: %s", mint, exc)

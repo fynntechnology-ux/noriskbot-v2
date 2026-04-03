@@ -634,15 +634,39 @@ class SolanaClient:
                     if conf in ("processed", "confirmed", "finalized"):
                         log.info("TX %s… %s  (%s)", sig[:16], label, conf)
                         output_amount = 0
+                        sol_spent     = 0
                         if label == "SELL":
                             output_amount = await self._get_sol_received(sig)
-                        return {"sig": sig, "status": conf, "output_amount": output_amount}
+                        elif label == "BUY":
+                            sol_spent = await self._get_sol_spent(sig)
+                        return {"sig": sig, "status": conf, "output_amount": output_amount, "sol_spent": sol_spent}
             except RuntimeError:
                 raise
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
             await asyncio.sleep(0.1)
         raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
+
+    async def _get_sol_spent(self, sig: str) -> float:
+        """Return actual SOL debited from wallet for a buy tx (in SOL, not lamports)."""
+        try:
+            tx = await self._rpc({
+                "method": "getTransaction",
+                "params": [sig, {
+                    "encoding":                      "json",
+                    "commitment":                    "confirmed",
+                    "maxSupportedTransactionVersion": 0,
+                }],
+            }, timeout=5)
+            meta = tx.get("meta", {})
+            pre  = meta.get("preBalances",  [])
+            post = meta.get("postBalances", [])
+            if pre and post:
+                delta = pre[0] - post[0]   # positive = SOL left wallet
+                return max(delta, 0) / config.LAMPORTS_PER_SOL
+        except Exception as exc:
+            log.debug("_get_sol_spent failed for %s: %s", sig[:16], exc)
+        return config.BUY_AMOUNT_SOL  # fallback to intended amount
 
     async def _get_sol_received(self, sig: str) -> int:
         """
