@@ -67,7 +67,7 @@ class TokenWatch:
     """Per-token state tracked from account updates."""
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
-                 "vtoken_raw", "accounts")
+                 "vtoken_raw", "accounts", "ata_created")
 
     def __init__(self, mint: str, symbol: str, name: str, created_at: float):
         self.mint         = mint
@@ -77,8 +77,9 @@ class TokenWatch:
         self.vsol         = VSOL_INIT
         self.peak_vsol    = VSOL_INIT
         self.had_activity = False
-        self.vtoken_raw: int | None           = None
-        self.accounts:   TokenAccounts | None = None
+        self.vtoken_raw:  int | None           = None
+        self.accounts:    TokenAccounts | None = None
+        self.ata_created: bool                 = False
 
 
 class PumpFunMonitor:
@@ -135,6 +136,9 @@ class PumpFunMonitor:
             if watch and accounts:
                 watch.accounts = accounts
                 log.debug("%s  accounts prefetched", mint[:8])
+                ok = await self._solana_client.create_ata(mint, accounts.assoc_user)
+                if ok:
+                    watch.ata_created = True
         except Exception as exc:
             log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
 
@@ -193,6 +197,7 @@ class PumpFunMonitor:
             "vsol_lamports":    int(watch.vsol * 1e9),
             "vtoken_raw":       watch.vtoken_raw,
             "token_accounts":   watch.accounts,
+            "ata_created":      watch.ata_created,
         })
 
     # ------------------------------------------------------------------

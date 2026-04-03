@@ -355,6 +355,43 @@ class SolanaClient:
             log.warning("prefetch: failed to parse tx for %s: %s", mint_str[:8], exc)
             return None
 
+    async def create_ata(self, mint_str: str, assoc_user_str: str) -> bool:
+        """Send a standalone ATA create-if-needed tx. Returns True on success."""
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        try:
+            mint       = Pubkey.from_string(mint_str)
+            assoc_user = Pubkey.from_string(assoc_user_str)
+            ix_cu_limit = set_compute_unit_limit(25_000)
+            ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
+            ix_ata = Instruction(
+                program_id=_ASSOC_TOKEN_2022,
+                accounts=[
+                    AccountMeta(pubkey=self._pubkey, is_signer=True,  is_writable=True),
+                    AccountMeta(pubkey=assoc_user,   is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=self._pubkey, is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=mint,         is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=_SYSTEM_PROGRAM,  is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=_TOKEN_2022,      is_signer=False, is_writable=False),
+                ],
+                data=b'\x01',
+            )
+            blockhash = await self._fresh_blockhash()
+            msg = MessageV0.try_compile(
+                payer=self._pubkey,
+                instructions=[ix_cu_limit, ix_cu_price, ix_ata],
+                address_lookup_table_accounts=[],
+                recent_blockhash=Hash.from_string(blockhash),
+            )
+            sig_obj = self._keypair.sign_message(bytes([0x80]) + bytes(msg))
+            tx_bytes = bytes(VersionedTransaction.populate(msg, [sig_obj]))
+            tx_b64   = base64.b64encode(tx_bytes).decode()
+            await self._send_via_rpc(tx_b64)
+            log.debug("ATA pre-created for %s", mint_str[:8])
+            return True
+        except Exception as exc:
+            log.debug("ATA pre-create failed for %s: %s", mint_str[:8], exc)
+            return False
+
     async def _get_blockhash(self) -> str:
         result = await self._rpc({
             "method": "getLatestBlockhash",
@@ -370,6 +407,7 @@ class SolanaClient:
         vtoken_raw:   int,
         vsol_lamports: int,
         blockhash:    str,
+        ata_created:  bool = False,
     ) -> bytes:
         """
         Build and sign a pump.fun buy transaction locally.
@@ -382,8 +420,8 @@ class SolanaClient:
           5. pump.fun buy
 
         AMM pricing:
-          tokens_out = expected_tokens * (1 - slippage)  — minimum acceptable, tolerates stale vSol
-          max_sol_cost = sol_lamports * (1 + slippage)
+          tokens_out = expected_tokens  — full AMM estimate, sets the buy size
+          max_sol_cost = sol_lamports * (1 + slippage)  — SOL ceiling, absorbs price drift
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
         from solders.system_program import transfer, TransferParams
@@ -417,12 +455,11 @@ class SolanaClient:
         )
 
         # ── 4. pump.fun buy ────────────────────────────────────────────────────
-        # tokens_out: expected AMM output, reduced by slippage so it's a true
+        # tokens_out: full AMM estimate — sets the buy size; max_sol_cost is the slippage guard
         # minimum acceptable amount — handles vSol drift between signal and execution
-        tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
-                           * (1 - config.SLIPPAGE))
+        tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports))
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
-        slippage_bps = int(config.SLIPPAGE * 100)
+        slippage_bps = int(config.SLIPPAGE * 10000)
 
         buy_data = (
             _BUY_DISC
@@ -474,9 +511,11 @@ class SolanaClient:
             data=bytes(buy_data),
         )
 
+        ixs = [ix_cu_limit, ix_cu_price, ix_tip, ix_buy] if ata_created else \
+              [ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy]
         msg = MessageV0.try_compile(
             payer=self._pubkey,
-            instructions=[ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
+            instructions=ixs,
             address_lookup_table_accounts=[self._pump_alt],
             recent_blockhash=Hash.from_string(blockhash),
         )
@@ -492,6 +531,7 @@ class SolanaClient:
         token_accounts: "TokenAccounts | None" = None,
         vsol_lamports: int | None           = None,
         vtoken_raw:    int | None           = None,
+        ata_created:   bool                 = False,
     ) -> str:
         log.info("BUY  %s  %.4f SOL", mint_str, sol_amount)
 
@@ -513,6 +553,7 @@ class SolanaClient:
                     vtoken_raw    = vtoken_raw,
                     vsol_lamports = vsol_lamports,
                     blockhash     = blockhash,
+                    ata_created   = ata_created,
                 )
                 tx_b64 = base64.b64encode(tx_bytes).decode()
                 sig    = await self._send_via_sender(tx_b64)
