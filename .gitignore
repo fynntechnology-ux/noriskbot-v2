@@ -1,0 +1,7 @@
+.env
+*.pem
+__pycache__/
+*.pyc
+*.log
+nohup.out
+state.json

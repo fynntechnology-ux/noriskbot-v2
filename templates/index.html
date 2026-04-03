@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>PUMP SNIPER</title>
+<style>
+  :root {
+    --bg:       #050508;
+    --bg2:      #0c0c14;
+    --bg3:      #12121e;
+    --border:   #1e1e32;
+    --accent:   #00d4ff;
+    --accent2:  #0088aa;
+    --green:    #00ff88;
+    --red:      #ff3355;
+    --yellow:   #ffcc00;
+    --dim:      #44445a;
+    --text:     #cccce0;
+    --white:    #f0f0ff;
+    --font:     'Courier New', 'Consolas', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Top bar ── */
+  #topbar {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--accent2);
+    padding: 6px 12px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-shrink: 0;
+  }
+  #topbar .logo {
+    color: var(--accent);
+    font-size: 14px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    white-space: nowrap;
+  }
+  #topbar .stat-group {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  .stat { display: flex; flex-direction: column; align-items: center; min-width: 60px; }
+  .stat .label { color: var(--dim); font-size: 9px; letter-spacing: 1px; text-transform: uppercase; }
+  .stat .value { color: var(--white); font-size: 13px; font-weight: bold; }
+  .stat .value.green  { color: var(--green); }
+  .stat .value.red    { color: var(--red); }
+  .stat .value.yellow { color: var(--yellow); }
+  .stat .value.cyan   { color: var(--accent); }
+
+  #conn-dot {
+    margin-left: auto;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    box-shadow: 0 0 6px var(--red);
+    transition: background 0.3s, box-shadow 0.3s;
+    flex-shrink: 0;
+  }
+  #conn-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+
+  /* ── Main grid ── */
+  #grid {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 1px;
+    background: var(--border);
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  .panel {
+    background: var(--bg2);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  .panel-header {
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    padding: 5px 10px;
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .panel-header .badge {
+    background: var(--accent2);
+    color: var(--white);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 9px;
+  }
+
+  .panel-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+  }
+
+  /* ── Tables ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  thead th {
+    background: var(--bg3);
+    color: var(--dim);
+    font-size: 9px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 4px 8px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  tbody tr {
+    border-bottom: 1px solid #0e0e18;
+    transition: background 0.15s;
+  }
+  tbody tr:hover { background: #0f0f1e; }
+  tbody td {
+    padding: 5px 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+  .empty-row td {
+    color: var(--dim);
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+  }
+
+  /* ── Colours ── */
+  .g { color: var(--green); }
+  .r { color: var(--red); }
+  .y { color: var(--yellow); }
+  .c { color: var(--accent); }
+  .w { color: var(--white); font-weight: bold; }
+  .d { color: var(--dim); }
+
+  /* ── Bonding bar ── */
+  .bonding-wrap { display: flex; align-items: center; gap: 5px; }
+  .bonding-bar-bg {
+    width: 60px; height: 5px;
+    background: var(--bg3);
+    border-radius: 2px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .bonding-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  /* ── Countdown ring ── */
+  .countdown {
+    font-weight: bold;
+    font-size: 12px;
+  }
+  .countdown.urgent { color: var(--red); animation: pulse 0.5s infinite alternate; }
+  .countdown.warn   { color: var(--yellow); }
+  .countdown.ok     { color: var(--green); }
+
+  @keyframes pulse { from { opacity: 1; } to { opacity: 0.4; } }
+
+  /* ── Event log ── */
+  .event-row { display: flex; gap: 8px; padding: 4px 10px; border-bottom: 1px solid #0a0a12; font-size: 11px; }
+  .event-row:hover { background: #0f0f1e; }
+  .ev-time  { color: var(--dim); flex-shrink: 0; width: 62px; }
+  .ev-icon  { flex-shrink: 0; width: 16px; text-align: center; }
+  .ev-sym   { flex-shrink: 0; width: 60px; font-weight: bold; }
+  .ev-detail { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* kind colours */
+  .kind-launch .ev-sym  { color: var(--accent); }
+  .kind-signal .ev-sym  { color: var(--yellow); }
+  .kind-buy    .ev-sym  { color: var(--green); }
+  .kind-sell   .ev-sym  { color: var(--green); }
+  .kind-skip   .ev-sym  { color: var(--dim); }
+  .kind-error  .ev-sym  { color: var(--red); }
+  .kind-warn   .ev-sym  { color: var(--yellow); }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── Flash animation for new rows ── */
+  @keyframes flash {
+    0%   { background: #1a1a30; }
+    100% { background: transparent; }
+  }
+  .flash { animation: flash 0.8s ease-out; }
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ── -->
+<div id="topbar">
+  <div class="logo">⚡ PUMP SNIPER</div>
+  <div class="stat-group">
+    <div class="stat"><div class="label">Uptime</div><div class="value cyan" id="s-uptime">00:00:00</div></div>
+    <div class="stat"><div class="label">Buys</div><div class="value white" id="s-buys">0</div></div>
+    <div class="stat"><div class="label">Sells</div><div class="value white" id="s-sells">0</div></div>
+    <div class="stat"><div class="label">Open</div><div class="value yellow" id="s-open">0</div></div>
+    <div class="stat"><div class="label">Tracking</div><div class="value cyan" id="s-tracking">0</div></div>
+    <div class="stat"><div class="label">SOL Spent</div><div class="value" id="s-spent">0.0000</div></div>
+    <div class="stat"><div class="label">SOL Back</div><div class="value" id="s-returned">0.0000</div></div>
+    <div class="stat"><div class="label">P&amp;L</div><div class="value" id="s-pnl">+0.0000</div></div>
+    <div class="stat"><div class="label">Sell Fails</div><div class="value" id="s-fails">0</div></div>
+  </div>
+  <div id="conn-dot" title="WebSocket connection"></div>
+</div>
+
+<!-- ── Main 2×2 grid ── -->
+<div id="grid">
+
+  <!-- Open Positions -->
+  <div class="panel">
+    <div class="panel-header">
+      ● Open Positions
+      <span class="badge" id="badge-open">0</span>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Bought</th>
+            <th>Age</th>
+            <th>Sell In</th>
+            <th>Bonding @ Buy</th>
+            <th>Peak Before</th>
+            <th>SOL</th>
+            <th>Order</th>
+          </tr>
+        </thead>
+        <tbody id="tbl-open"><tr class="empty-row"><td colspan="8">no open positions</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Recent Trades -->
+  <div class="panel">
+    <div class="panel-header">
+      ◎ Recent Trades
+      <span class="badge" id="badge-closed">0</span>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Bought</th>
+            <th>Held</th>
+            <th>Bonding</th>
+            <th>Peak</th>
+            <th>SOL</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="tbl-closed"><tr class="empty-row"><td colspan="7">no trades yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Token Tracker -->
+  <div class="panel">
+    <div class="panel-header">
+      ◈ Tracking
+      <span class="badge" id="badge-track">0</span>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Age</th>
+            <th>Bonding Now</th>
+            <th>Peak</th>
+          </tr>
+        </thead>
+        <tbody id="tbl-track"><tr class="empty-row"><td colspan="5">waiting for launches…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Event Log -->
+  <div class="panel">
+    <div class="panel-header">≡ Event Log</div>
+    <div class="panel-body" id="log-body">
+      <div class="event-row"><div class="ev-time"></div><div class="ev-icon"></div><div class="ev-sym d">waiting…</div><div class="ev-detail"></div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const KIND_ICON = {
+  launch: '🚀', signal: '⚡', buy: '💰', sell: '💸',
+  skip: '–', error: '✗', warn: '⚠'
+};
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toTimeString().slice(0,8);
+}
+function fmtAge(s) {
+  s = Math.floor(s);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+function fmtBonding(pct, maxW=60) {
+  const fill = Math.min(pct / 100 * maxW, maxW);
+  const col = pct < 5 ? '#00ff88' : pct < 30 ? '#ffcc00' : '#ff3355';
+  return `<div class="bonding-wrap">
+    <div class="bonding-bar-bg">
+      <div class="bonding-bar-fill" style="width:${fill}px;background:${col}"></div>
+    </div>
+    <span class="${pct < 5 ? 'g' : pct < 30 ? 'y' : 'r'}">${pct.toFixed(3)}%</span>
+  </div>`;
+}
+function fmtCountdown(s) {
+  const cls = s <= 5 ? 'urgent' : s <= 15 ? 'warn' : 'ok';
+  return `<span class="countdown ${cls}">${s.toFixed(0)}s</span>`;
+}
+
+// ── State tracking for flash-on-new ──
+let knownMints = new Set();
+let lastEventTs = 0;
+
+function applyStats(d) {
+  document.getElementById('s-uptime').textContent    = d.uptime;
+  document.getElementById('s-buys').textContent      = d.total_buys;
+  document.getElementById('s-sells').textContent     = d.total_sells;
+  document.getElementById('s-open').textContent      = d.open_count;
+  document.getElementById('s-tracking').textContent  = d.tracking_count;
+  document.getElementById('s-spent').textContent     = d.sol_spent.toFixed(4);
+  document.getElementById('s-returned').textContent  = d.sol_returned.toFixed(4);
+  document.getElementById('s-fails').textContent     = d.sell_failures;
+
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = (d.pnl_sol >= 0 ? '+' : '') + d.pnl_sol.toFixed(4);
+  pnlEl.className = 'value ' + (d.pnl_sol > 0 ? 'green' : d.pnl_sol < 0 ? 'red' : '');
+}
+
+function renderOpen(positions) {
+  document.getElementById('badge-open').textContent = positions.length;
+  const tbody = document.getElementById('tbl-open');
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">no open positions</td></tr>';
+    return;
+  }
+  tbody.innerHTML = positions.map(p => {
+    const isNew = !knownMints.has(p.mint);
+    if (isNew) knownMints.add(p.mint);
+    return `<tr class="${isNew ? 'flash' : ''}">
+      <td class="w">${esc(p.symbol)}</td>
+      <td class="d">${fmtTime(p.bought_at)}</td>
+      <td>${fmtAge(p.age_s)}</td>
+      <td>${fmtCountdown(p.sell_in_s)}</td>
+      <td>${fmtBonding(p.bonding_at_buy)}</td>
+      <td class="d">${p.peak_bonding.toFixed(4)}%</td>
+      <td class="c">${p.sol_spent}</td>
+      <td class="d" style="max-width:110px">${p.order_id.slice(0,14)}…</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderClosed(positions) {
+  document.getElementById('badge-closed').textContent = positions.length;
+  const tbody = document.getElementById('tbl-closed');
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="7">no trades yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = positions.map(p => {
+    const ok = p.sell_result === 'ok';
+    return `<tr>
+      <td class="w">${esc(p.symbol)}</td>
+      <td class="d">${fmtTime(p.bought_at)}</td>
+      <td class="d">${fmtAge(p.age_s)}</td>
+      <td>${fmtBonding(p.bonding_at_buy)}</td>
+      <td class="d">${p.peak_bonding.toFixed(4)}%</td>
+      <td class="d">${p.sol_spent}</td>
+      <td class="${ok ? 'g' : 'r'}">${ok ? '✓ OK' : '✗ FAIL'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTracking(tokens) {
+  if (!Array.isArray(tokens)) return;
+  document.getElementById('badge-track').textContent = tokens.length;
+  const tbody = document.getElementById('tbl-track');
+  if (!tokens.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">waiting for launches…</td></tr>';
+    return;
+  }
+  tbody.innerHTML = tokens.map(t => `<tr>
+    <td class="w">${esc(t.symbol || t.mint.slice(0,8))}</td>
+    <td class="d" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${esc(t.name || '')}</td>
+    <td>${fmtAge(t.age_s || 0)}</td>
+    <td>${fmtBonding(+(t.current_bonding) || 0)}</td>
+    <td class="d">${(+(t.peak_bonding) || 0).toFixed(4)}%</td>
+  </tr>`).join('');
+}
+
+function renderLog(events) {
+  if (!Array.isArray(events) || !events.length) return;
+  const container = document.getElementById('log-body');
+  // Only re-render if newest event is newer than what we have
+  if (events[0].ts <= lastEventTs) return;
+  lastEventTs = events[0].ts;
+
+  container.innerHTML = events.slice(0, 60).map(e => `
+    <div class="event-row kind-${e.kind || ''}">
+      <div class="ev-time">${fmtTime(e.ts)}</div>
+      <div class="ev-icon">${KIND_ICON[e.kind] || '·'}</div>
+      <div class="ev-sym">${esc(e.symbol || (e.mint||'').slice(0,8))}</div>
+      <div class="ev-detail">${esc(e.detail || '')}</div>
+    </div>`).join('');
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── WebSocket ──
+let ws;
+let reconnectDelay = 1000;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    document.getElementById('conn-dot').classList.add('connected');
+    reconnectDelay = 1000;
+  };
+
+  ws.onmessage = (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    // Each panel isolated — one crash won't affect others
+    try { applyStats(d); }              catch(err) { console.error('stats:', err); }
+    try { renderOpen(d.open_positions); }  catch(err) { console.error('open:', err); }
+    try { renderClosed(d.closed_positions); } catch(err) { console.error('closed:', err); }
+    try { renderTracking(d.tracking); }  catch(err) { console.error('track:', err); }
+    try { renderLog(d.events); }         catch(err) { console.error('log:', err); }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('conn-dot').classList.remove('connected');
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body>
+</html>
