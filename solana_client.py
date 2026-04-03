@@ -643,8 +643,8 @@ class SolanaClient:
         unsigned_tx = await self._get_pump_tx(payload)
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
-        sig = await self._send_via_rpc(tx_b64)
-        log.info("BUY  submitted via FALLBACK (PumpPortal tx, RPC)  sig=%s", sig)
+        sig = await self._send_fast(tx_b64)
+        log.info("BUY  submitted via FALLBACK (PumpPortal tx, fast)  sig=%s", sig)
         return sig
 
     async def sell_all(self, mint_str: str) -> str:
@@ -673,8 +673,8 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_via_rpc(tx_b64)
-        log.info("SELL submitted via RPC  sig=%s", sig)
+        sig = await self._send_fast(tx_b64)
+        log.info("SELL submitted (fast)  sig=%s", sig)
         return sig
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
