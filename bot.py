@@ -24,7 +24,8 @@ class PumpSnipeBot:
             solana_client=self._solana,
             state=state,
         )
-        self._buy_lock = asyncio.Semaphore(config.MAX_CONCURRENT_POSITIONS)
+        self._buy_lock = asyncio.Lock()
+        self._claimed: set[str] = set()   # mints reserved but not yet in positions
 
     async def _on_signal(self, signal: dict):
         mint   = signal["mint"]
@@ -42,17 +43,16 @@ class PumpSnipeBot:
                         mint, symbol, name)
             return
 
-        if self._positions.open_count >= config.MAX_CONCURRENT_POSITIONS:
-            self._state.log("skip", mint, symbol,
-                            f"max positions ({config.MAX_CONCURRENT_POSITIONS}) reached")
-            log.warning("Max positions reached. Skipping %s.", mint)
-            return
-
+        # Reserve slot under lock — release before the actual buy RPC call
         async with self._buy_lock:
-            if self._positions.has_position(mint):
+            active = self._positions.open_count + len(self._claimed)
+            if active >= config.MAX_CONCURRENT_POSITIONS:
+                self._state.log("skip", mint, symbol,
+                                f"max positions ({config.MAX_CONCURRENT_POSITIONS}) reached")
+                log.warning("Max positions reached. Skipping %s.", mint)
                 return
-
-            # Pre-flight balance check — avoid on-chain Custom:1 (insufficient lamports)
+            if self._positions.has_position(mint) or mint in self._claimed:
+                return
             buy_lamports = int(config.BUY_AMOUNT_SOL * config.LAMPORTS_PER_SOL)
             required     = buy_lamports + config.MIN_BUY_BUFFER_LAMPORTS
             if self._solana._wallet_balance_lamports < required:
@@ -62,37 +62,34 @@ class PumpSnipeBot:
                 self._state.log("skip", mint, symbol,
                                 f"insufficient balance {bal_sol:.4f} SOL")
                 return
+            self._claimed.add(mint)
 
-            log.info("Buying  %s  (age=%.1fs)", mint, signal["age_seconds"])
+        # Buy runs outside the lock — concurrent buys proceed in parallel
+        log.info("Buying  %s  (age=%.1fs)", mint, signal["age_seconds"])
+        try:
+            order_id = await self._solana.buy(
+                mint_str       = mint,
+                sol_amount     = config.BUY_AMOUNT_SOL,
+                token_accounts = signal.get("token_accounts"),
+                vsol_lamports  = signal.get("vsol_lamports"),
+                vtoken_raw     = signal.get("vtoken_raw"),
+            )
+            await self._positions.open(
+                mint=mint,
+                symbol=symbol,
+                name=name,
+                buy_order_id=order_id,
+                bonding_at_buy=signal["bonding_pct"],
+                peak_bonding=signal["peak_bonding_pct"],
+            )
+            asyncio.create_task(self._solana.refresh_balance())
+            asyncio.create_task(self._confirm_buy(order_id, mint, symbol))
 
-            try:
-                order_id = await self._solana.buy(
-                    mint_str       = mint,
-                    sol_amount     = config.BUY_AMOUNT_SOL,
-                    token_accounts = signal.get("token_accounts"),
-                    vsol_lamports  = signal.get("vsol_lamports"),
-                    vtoken_raw     = signal.get("vtoken_raw"),
-                )
-                # Open position + start sell timer immediately — don't wait for
-                # on-chain confirmation (saves 1-5s). Buy confirms well within
-                # the 60s hold window; sell_all handles empty balance gracefully.
-                await self._positions.open(
-                    mint=mint,
-                    symbol=symbol,
-                    name=name,
-                    buy_order_id=order_id,
-                    bonding_at_buy=signal["bonding_pct"],
-                    peak_bonding=signal["peak_bonding_pct"],
-                )
-                # Refresh balance + confirm in background
-                asyncio.create_task(self._solana.refresh_balance())
-                asyncio.create_task(
-                    self._confirm_buy(order_id, mint, symbol)
-                )
-
-            except Exception as exc:
-                self._state.log("error", mint, symbol, f"buy failed: {exc}")
-                log.error("BUY failed for %s: %s", mint, exc, exc_info=True)
+        except Exception as exc:
+            self._state.log("error", mint, symbol, f"buy failed: {exc}")
+            log.error("BUY failed for %s: %s", mint, exc, exc_info=True)
+        finally:
+            self._claimed.discard(mint)
 
     async def _confirm_buy(self, order_id: str, mint: str, symbol: str):
         try:

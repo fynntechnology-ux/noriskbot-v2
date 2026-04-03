@@ -121,6 +121,7 @@ class HeliusAccountFeed:
                     config.HELIUS_RPC_WS,
                     ping_interval=20,
                     ping_timeout=10,
+                    max_size=2**18,  # 256KB — plenty for account updates
                 ) as ws:
                     self._ws = ws
                     # Clear ephemeral state from previous connection

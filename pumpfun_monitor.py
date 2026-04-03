@@ -67,7 +67,8 @@ class TokenWatch:
     """Per-token state tracked from account updates."""
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
-                 "vtoken_raw", "accounts", "ata_created")
+                 "vtoken_raw", "accounts", "ata_created",
+                 "last_dashboard_update")
 
     def __init__(self, mint: str, symbol: str, name: str, created_at: float):
         self.mint         = mint
@@ -80,6 +81,7 @@ class TokenWatch:
         self.vtoken_raw:  int | None           = None
         self.accounts:    TokenAccounts | None = None
         self.ata_created: bool                 = False
+        self.last_dashboard_update: float      = 0.0
 
 
 class PumpFunMonitor:
@@ -137,11 +139,15 @@ class PumpFunMonitor:
             if watch and accounts:
                 watch.accounts = accounts
                 log.debug("%s  accounts prefetched", mint[:8])
-                ok = await self._solana_client.create_ata(mint, accounts.assoc_user)
-                if ok:
-                    watch.ata_created = True
+                asyncio.create_task(self._create_ata_bg(mint, accounts.assoc_user))
         except Exception as exc:
             log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
+
+    async def _create_ata_bg(self, mint: str, assoc_user: str):
+        ok = await self._solana_client.create_ata(mint, assoc_user)
+        watch = self._watching.get(mint)
+        if ok and watch:
+            watch.ata_created = True
 
     def _process_vsol(self, watch: TokenWatch, vsol: float):
         """Core signal logic — idempotent, safe to call from multiple feeds."""
@@ -156,8 +162,10 @@ class PumpFunMonitor:
             watch.peak_vsol = vsol
 
         # Update dashboard
-        progress = _progress(vsol)
-        self._state.update_token_bonding(mint, progress / 100.0)
+        now = time.time()
+        if now - watch.last_dashboard_update >= 0.5:
+            self._state.update_token_bonding(mint, _progress(vsol) / 100.0)
+            watch.last_dashboard_update = now
 
         # Mark activity once vSol rises meaningfully
         if not watch.had_activity and (watch.peak_vsol - VSOL_INIT) >= PEAK_SOL:
@@ -243,6 +251,7 @@ class PumpFunMonitor:
                     config.PUMPPORTAL_WS,
                     ping_interval=20,
                     ping_timeout=10,
+                    max_size=2**18,  # 256KB — plenty for token events
                 ) as ws:
                     self._ws = ws
                     log.info("PumpPortal connected.")

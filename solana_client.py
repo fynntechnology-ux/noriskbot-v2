@@ -163,7 +163,7 @@ class SolanaClient:
     async def _blockhash_refresher(self):
         """Background task: keep blockhash ≤300ms old."""
         while True:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
             try:
                 self._blockhash    = await self._get_blockhash()
                 self._blockhash_ts = time.time()
@@ -172,7 +172,7 @@ class SolanaClient:
 
     async def _fresh_blockhash(self) -> str:
         """Return cached blockhash if ≤400ms old, else fetch synchronously."""
-        if time.time() - self._blockhash_ts <= 0.4 and self._blockhash:
+        if time.time() - self._blockhash_ts <= 0.6 and self._blockhash:
             return self._blockhash
         log.warning("Blockhash cache stale — fetching now")
         bh = await self._get_blockhash()
@@ -273,6 +273,17 @@ class SolanaClient:
         if "result" not in data:
             raise RuntimeError(f"Sender unexpected response: {data}")
         return data["result"]
+
+    async def _send_fast(self, tx_b64: str) -> str:
+        """Race Helius Sender and RPC in parallel — first successful response wins."""
+        tasks = [
+            asyncio.create_task(self._send_via_sender(tx_b64)),
+            asyncio.create_task(self._send_via_rpc(tx_b64)),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        return done.pop().result()
 
     # ── PumpPortal unsigned transaction builder ──────────────────────────────
 
@@ -580,7 +591,7 @@ class SolanaClient:
                     blockhash     = blockhash,
                 )
                 tx_b64 = base64.b64encode(tx_bytes).decode()
-                sig    = await self._send_via_sender(tx_b64)
+                sig    = await self._send_fast(tx_b64)
                 log.info("BUY  submitted (local)  sig=%s", sig)
                 return sig
             except Exception as exc:
