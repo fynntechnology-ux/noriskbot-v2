@@ -545,7 +545,7 @@ class SolanaClient:
                 AccountMeta(_const14,     False, False),  # [14]
                 AccountMeta(_pfee_prog,   False, False),  # [15] PFEE_PROG
                 AccountMeta(unk16,        False, True),   # [16]
-                AccountMeta(_const17,     False, True),   # [17] writable
+                AccountMeta(_const17,     False, False),  # [17] readonly
             ],
             data=bytes(buy_data),
         )
