@@ -535,7 +535,6 @@ class SolanaClient:
         unsigned_tx = await self._get_pump_tx(payload)
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
-        # PumpPortal txs have no Helius tip — use regular RPC not Sender
         sig = await self._send_via_sender(tx_b64)
         log.info("BUY  submitted via FALLBACK (PumpPortal tx, Sender priority)  sig=%s", sig)
         return sig
@@ -566,7 +565,6 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        # PumpPortal txs have no Helius tip — use regular RPC not Sender
         sig = await self._send_via_sender(tx_b64)
         log.info("SELL submitted via Sender (priority)  sig=%s", sig)
         return sig
