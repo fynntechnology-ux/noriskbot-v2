@@ -52,6 +52,17 @@ class PumpSnipeBot:
             if self._positions.has_position(mint):
                 return
 
+            # Pre-flight balance check — avoid on-chain Custom:1 (insufficient lamports)
+            buy_lamports = int(config.BUY_AMOUNT_SOL * config.LAMPORTS_PER_SOL)
+            required     = buy_lamports + config.MIN_BUY_BUFFER_LAMPORTS
+            if self._solana._wallet_balance_lamports < required:
+                bal_sol = self._solana._wallet_balance_lamports / config.LAMPORTS_PER_SOL
+                log.warning("Insufficient balance %.4f SOL (need %.4f) — skipping %s",
+                            bal_sol, required / config.LAMPORTS_PER_SOL, mint)
+                self._state.log("skip", mint, symbol,
+                                f"insufficient balance {bal_sol:.4f} SOL")
+                return
+
             log.info("Buying  %s  (age=%.1fs)", mint, signal["age_seconds"])
 
             try:

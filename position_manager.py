@@ -62,6 +62,7 @@ class PositionManager:
                                 f"sold  returned≈{sol_back:.4f} SOL  order={order_id[:12]}…")
                 held = time.time() - pos.bought_at
                 log.info("SELL complete  %s  held=%.1fs", pos.mint, held)
+                await self._solana.refresh_balance()
                 return
             except Exception as exc:
                 log.error("SELL attempt %d failed for %s: %s", attempt, pos.mint, exc)

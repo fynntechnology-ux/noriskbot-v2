@@ -34,28 +34,32 @@ PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 # ── pump.fun constant addresses ───────────────────────────────────────────────
 
 _PUMP_NEW_PROG    = Pubkey.from_string("FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe")
-_PUMP_OLD_PROG    = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-_PFEE_PROG        = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
-
-_GLOBAL           = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5zXDFQLa3s9Cz1g")
-_FEE_RECIPIENT    = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnkwbGEHBKHsvCb4RRTMGU")
-_EVENT_AUTHORITY  = Pubkey.from_string("Ce6TQqeH3go77A8dz3FPRp1MTEFGYZiQAzRoXH3MRBkS")
-_PUMP_PDA         = Pubkey.from_string("Hq2wp8uQPApxkjFKuvYQBBqjkRqQmvBBs9dEHRfN9Cmb")
-_PUMP_CONST2      = Pubkey.from_string("8Wf5TiA9KN2FLGE1PJp1UyeCpMWP4r1C12fKHxvLkFDL")
-_PFEE_CONST       = Pubkey.from_string("7FeFBYb5FWAS8KwxT1CUZ3K3UyCnFbJTa2bsTq3QjYNW")
-
-_TOKEN_PROGRAM    = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 _TOKEN_2022       = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 _ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs")
 _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
-_SYSVAR_RENT      = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
 # Helius Sender tip recipient — must be one of the addresses Sender accepts
 _HELIUS_TIP       = Pubkey.from_string("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey")
 
 # Buy instruction discriminator (8 bytes)
 _BUY_DISC = bytes([0x66, 0x32, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
+
+# pump.fun Address Lookup Table — contains all global program/account constants.
+# Fetched once at startup; passed to MessageV0.try_compile so the compiler can
+# replace full 32-byte pubkeys with 1-byte ALT references in the compiled tx.
+#
+# Relevant entries (verified by decoding a live PumpPortal buy tx):
+#   [1]  11111111111111111111111111111111               SYSTEM_PROGRAM    buy[7]  (readonly)
+#   [2]  6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P  PUMP_OLD_PROG     buy[11] (readonly)
+#   [5]  Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1 CONST_10          buy[10] (readonly)
+#   [11] 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf  GLOBAL            buy[0]  (readonly)
+#   [22] 62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV  FEE_RECIPIENT     buy[1]  (writable)
+#   [24] Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y  CONST_12          buy[12] (readonly)
+#   [26] FgX1cdFq7khWeivEfHCULBA6ovtSr9djdAfJ9r3LvNST  CONST_17          buy[17] (writable)
+#   [28] pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ   PFEE_PROG         buy[15] (readonly)
+#   [29] 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt  CONST_14          buy[14] (readonly)
+_PUMP_ALT_ADDR = Pubkey.from_string("84gxtAAWToZ6xep3wrWsx8TEoLB7EBS9VrKkV9CtMdJi")
 
 
 @dataclass
@@ -77,8 +81,10 @@ class SolanaClient:
             limit=20, ttl_dns_cache=300, enable_cleanup_closed=True,
         )
         self._session       = aiohttp.ClientSession(connector=connector)
-        self._blockhash     = ""
-        self._blockhash_ts  = 0.0
+        self._blockhash              = ""
+        self._blockhash_ts           = 0.0
+        self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
+        self._wallet_balance_lamports: int = 0
         log.info("Wallet: %s", self._pubkey)
 
     async def close(self):
@@ -114,8 +120,45 @@ class SolanaClient:
             except Exception as exc:
                 log.warning("Blockhash prime failed: %s", exc)
 
-        await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash())
+        await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash(),
+                             self._fetch_pump_alt(), self.refresh_balance())
         asyncio.create_task(self._blockhash_refresher())
+
+    async def _fetch_pump_alt(self):
+        """Fetch and parse the pump.fun Address Lookup Table once at startup."""
+        from solders.address_lookup_table_account import AddressLookupTableAccount
+        try:
+            result = await self._rpc({
+                "method": "getAccountInfo",
+                "params": [str(_PUMP_ALT_ADDR), {"encoding": "base64"}],
+            }, timeout=5)
+            data = base64.b64decode(result["value"]["data"][0])
+            # ALT on-chain format: 56-byte header, then N × 32-byte pubkeys
+            header_size = 56
+            n = (len(data) - header_size) // 32
+            addresses = [
+                Pubkey.from_bytes(data[header_size + i * 32 : header_size + (i + 1) * 32])
+                for i in range(n)
+            ]
+            self._pump_alt = AddressLookupTableAccount(key=_PUMP_ALT_ADDR, addresses=addresses)
+            log.info("Pump ALT loaded: %d entries", n)
+        except Exception as exc:
+            log.error("Failed to load pump ALT — local buy disabled: %s", exc)
+
+    async def refresh_balance(self) -> int:
+        """Fetch current wallet SOL balance and cache it."""
+        try:
+            result = await self._rpc({
+                "method": "getBalance",
+                "params": [str(self._pubkey), {"commitment": "processed"}],
+            }, timeout=3)
+            self._wallet_balance_lamports = result["value"]
+            log.debug("Wallet balance: %d lamports (%.4f SOL)",
+                      self._wallet_balance_lamports,
+                      self._wallet_balance_lamports / 1_000_000_000)
+        except Exception as exc:
+            log.warning("Balance refresh failed: %s", exc)
+        return self._wallet_balance_lamports
 
     async def _blockhash_refresher(self):
         """Background task: keep blockhash ≤300ms old."""
@@ -288,7 +331,9 @@ class SolanaClient:
         try:
             tx_bytes = await self._get_pump_tx(payload)
         except Exception as exc:
-            log.warning("prefetch PumpPortal call failed for %s: %s", mint_str[:8], exc)
+            body = f" (status={exc.status})" if hasattr(exc, "status") else ""
+            log.warning("prefetch FAILED for %s%s: %s — will use PumpPortal fallback",
+                        mint_str, body, exc)
             return None
 
         try:
@@ -389,27 +434,39 @@ class SolanaClient:
         pump_const1 = Pubkey.from_string(accounts.pump_const1)
         unk16       = Pubkey.from_string(accounts.unk16)
 
+        # ALT-sourced constants — indices verified by decoding a live PumpPortal buy tx
+        alt = self._pump_alt.addresses
+        _global    = alt[11]  # buy[0]  GLOBAL (4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf)
+        _fee_recip = alt[22]  # buy[1]  FEE_RECIPIENT (62qc2CNX...fafNgV) writable
+        _sys_prog  = alt[1]   # buy[7]  SYSTEM_PROGRAM (11111...)
+        _const10   = alt[5]   # buy[10] Ce6TQqeHC9p8...
+        _pump_old  = alt[2]   # buy[11] PUMP_OLD_PROG (6EF8...)
+        _const12   = alt[24]  # buy[12] Hq2wp8uJ9...
+        _const14   = alt[29]  # buy[14] 8Wf5TiAheL...
+        _pfee_prog = alt[28]  # buy[15] pfeeUxB6... (PFEE_PROG)
+        _const17   = alt[26]  # buy[17] FgX1cdFq7... writable
+
         ix_buy = Instruction(
             program_id=_PUMP_NEW_PROG,
             accounts=[
-                AccountMeta(_GLOBAL,          False, False),  # [0]
-                AccountMeta(_FEE_RECIPIENT,   False, True),   # [1]
-                AccountMeta(mint,             False, False),  # [2]
-                AccountMeta(bc,               False, True),   # [3]
-                AccountMeta(abc,              False, True),   # [4]
-                AccountMeta(assoc_user,       False, True),   # [5]
-                AccountMeta(self._pubkey,     True,  True),   # [6]
-                AccountMeta(_SYSTEM_PROGRAM,  False, False),  # [7]
-                AccountMeta(_TOKEN_2022,      False, False),  # [8]
-                AccountMeta(cvlt,             False, True),   # [9]
-                AccountMeta(_EVENT_AUTHORITY, False, False),  # [10]
-                AccountMeta(_PUMP_OLD_PROG,   False, False),  # [11]
-                AccountMeta(_PUMP_PDA,        False, False),  # [12]
-                AccountMeta(pump_const1,      False, True),   # [13] per-token, from prefetch
-                AccountMeta(_PUMP_CONST2,     False, False),  # [14]
-                AccountMeta(_PFEE_PROG,       False, False),  # [15]
-                AccountMeta(unk16,            False, True),   # [16]
-                AccountMeta(_PFEE_CONST,      False, True),   # [17]
+                AccountMeta(_global,      False, False),  # [0]  GLOBAL
+                AccountMeta(_fee_recip,   False, True),   # [1]  FEE_RECIPIENT (writable)
+                AccountMeta(mint,         False, False),  # [2]
+                AccountMeta(bc,           False, True),   # [3]
+                AccountMeta(abc,          False, True),   # [4]
+                AccountMeta(assoc_user,   False, True),   # [5]
+                AccountMeta(self._pubkey, True,  True),   # [6]
+                AccountMeta(_sys_prog,    False, False),  # [7]  SYSTEM_PROGRAM
+                AccountMeta(_TOKEN_2022,  False, False),  # [8]
+                AccountMeta(cvlt,         False, True),   # [9]
+                AccountMeta(_const10,     False, False),  # [10]
+                AccountMeta(_pump_old,    False, False),  # [11] PUMP_OLD_PROG
+                AccountMeta(_const12,     False, False),  # [12]
+                AccountMeta(pump_const1,  False, True),   # [13] per-token (prefetch static[5])
+                AccountMeta(_const14,     False, False),  # [14]
+                AccountMeta(_pfee_prog,   False, False),  # [15] PFEE_PROG
+                AccountMeta(unk16,        False, True),   # [16]
+                AccountMeta(_const17,     False, True),   # [17] writable
             ],
             data=bytes(buy_data),
         )
@@ -417,7 +474,7 @@ class SolanaClient:
         msg = MessageV0.try_compile(
             payer=self._pubkey,
             instructions=[ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
-            address_lookup_table_accounts=[],
+            address_lookup_table_accounts=[self._pump_alt],
             recent_blockhash=Hash.from_string(blockhash),
         )
         sig = self._keypair.sign_message(bytes([0x80]) + bytes(msg))
@@ -438,7 +495,8 @@ class SolanaClient:
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
 
         # Phase 2: build locally if we have all the data
-        if (token_accounts is not None
+        if (self._pump_alt is not None
+                and token_accounts is not None
                 and vsol_lamports is not None
                 and vtoken_raw is not None
                 and vtoken_raw > 0
@@ -479,7 +537,7 @@ class SolanaClient:
         tx_b64      = base64.b64encode(tx_bytes).decode()
         # PumpPortal txs have no Helius tip — use regular RPC not Sender
         sig = await self._send_via_rpc(tx_b64)
-        log.info("BUY  submitted (pumpportal)  sig=%s", sig)
+        log.warning("BUY  submitted via FALLBACK (no tip/priority)  sig=%s", sig)
         return sig
 
     async def sell_all(self, mint_str: str) -> str:
@@ -510,7 +568,7 @@ class SolanaClient:
 
         # PumpPortal txs have no Helius tip — use regular RPC not Sender
         sig = await self._send_via_rpc(tx_b64)
-        log.info("SELL submitted  sig=%s", sig)
+        log.warning("SELL submitted via RPC (no tip/priority)  sig=%s", sig)
         return sig
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
