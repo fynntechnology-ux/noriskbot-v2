@@ -673,7 +673,7 @@ class SolanaClient:
                 raise
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.25)
         raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
 
     async def _get_sol_spent(self, sig: str) -> float:
