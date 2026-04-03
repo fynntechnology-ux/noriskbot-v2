@@ -374,11 +374,13 @@ class SolanaClient:
         # ── 4. pump.fun buy ────────────────────────────────────────────────────
         tokens_out   = sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
+        slippage_bps = int(config.SLIPPAGE * 100)
 
         buy_data = (
             _BUY_DISC
             + struct.pack("<Q", tokens_out)
             + struct.pack("<Q", max_sol_cost)
+            + struct.pack("<H", slippage_bps)  # required by pump.fun on-chain struct
         )
 
         bc          = Pubkey.from_string(accounts.bonding_curve)
