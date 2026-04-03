@@ -341,7 +341,7 @@ class SolanaClient:
             "mint":             mint_str,
             "amount":           config.BUY_AMOUNT_SOL,
             "denominatedInSol": "true",
-            "slippage":         int(config.SLIPPAGE * 10000),
+            "slippage":         int(config.SLIPPAGE * 100),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }
@@ -636,7 +636,7 @@ class SolanaClient:
             "mint":             mint_str,
             "amount":           sol_amount,
             "denominatedInSol": "true",
-            "slippage":         int(config.SLIPPAGE * 10000),
+            "slippage":         int(config.SLIPPAGE * 100),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }
@@ -662,7 +662,7 @@ class SolanaClient:
             "mint":             mint_str,
             "amount":           raw_balance,
             "denominatedInSol": "false",
-            "slippage":         int(config.SLIPPAGE * 10000),
+            "slippage":         int(config.SLIPPAGE * 100),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }
