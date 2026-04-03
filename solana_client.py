@@ -324,7 +324,7 @@ class SolanaClient:
             "mint":             mint_str,
             "amount":           config.BUY_AMOUNT_SOL,
             "denominatedInSol": "true",
-            "slippage":         int(config.SLIPPAGE * 100),
+            "slippage":         int(config.SLIPPAGE * 10000),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }
@@ -391,6 +391,29 @@ class SolanaClient:
         except Exception as exc:
             log.debug("ATA pre-create failed for %s: %s", mint_str[:8], exc)
             return False
+
+    async def _fetch_bc_reserves(self, bc_addr: str) -> tuple[int, int] | None:
+        """Fetch vsol_lamports and vtoken_raw directly from the bonding curve account."""
+        import struct as _struct
+        try:
+            result = await self._rpc({
+                "method": "getAccountInfo",
+                "params": [bc_addr, {"encoding": "base64", "commitment": "processed"}],
+            }, timeout=3)
+            data_b64 = (result.get("value") or {}).get("data", [None])[0]
+            if not data_b64:
+                return None
+            import base64 as _b64
+            data = _b64.b64decode(data_b64)
+            if len(data) < 24:
+                return None
+            vtoken_raw    = _struct.unpack_from("<Q", data, 8)[0]
+            vsol_lamports = _struct.unpack_from("<Q", data, 16)[0]
+            log.debug("BC reserves fetched: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
+            return vsol_lamports, vtoken_raw
+        except Exception as exc:
+            log.debug("_fetch_bc_reserves failed for %s: %s", bc_addr[:8], exc)
+            return None
 
     async def _get_blockhash(self) -> str:
         result = await self._rpc({
@@ -533,6 +556,12 @@ class SolanaClient:
 
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
 
+        # If vtoken_raw is missing, fetch it directly from the bonding curve
+        if vtoken_raw is None and token_accounts is not None:
+            vsol_lamports, vtoken_raw = await self._fetch_bc_reserves(
+                token_accounts.bonding_curve
+            ) or (vsol_lamports, None)
+
         # Phase 2: build locally if we have all the data
         if (self._pump_alt is not None
                 and token_accounts is not None
@@ -567,7 +596,7 @@ class SolanaClient:
             "mint":             mint_str,
             "amount":           sol_amount,
             "denominatedInSol": "true",
-            "slippage":         int(config.SLIPPAGE * 100),
+            "slippage":         int(config.SLIPPAGE * 10000),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }
@@ -591,9 +620,9 @@ class SolanaClient:
             "publicKey":        str(self._pubkey),
             "action":           "sell",
             "mint":             mint_str,
-            "amount":           ui_balance,
+            "amount":           raw_balance,
             "denominatedInSol": "false",
-            "slippage":         int(config.SLIPPAGE * 100),
+            "slippage":         int(config.SLIPPAGE * 10000),
             "priorityFee":      priority_fee_sol,
             "pool":             "pump",
         }

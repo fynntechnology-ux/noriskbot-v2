@@ -89,6 +89,7 @@ class PumpFunMonitor:
         self._solana_client  = solana_client
         self._watching: dict[str, TokenWatch] = {}
         self._ws             = None
+        self._pending_unsubs: set[str]        = set()
         self._helius         = HeliusAccountFeed(on_update=self._on_helius_update)
 
     # ------------------------------------------------------------------
@@ -216,11 +217,13 @@ class PumpFunMonitor:
                 self._state.remove_tracked(mint)
                 del self._watching[mint]
                 await self._helius.unsubscribe(mint)
+                self._pending_unsubs.add(mint)
                 if self._ws:
                     try:
                         await self._ws.send(json.dumps(
                             {"method": "unsubscribeTokenTrade", "keys": [mint]}
                         ))
+                        self._pending_unsubs.discard(mint)
                     except Exception:
                         pass
             self._state.prune_name_registry()
@@ -244,6 +247,11 @@ class PumpFunMonitor:
                     self._ws = ws
                     log.info("PumpPortal connected.")
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    if self._pending_unsubs:
+                        await ws.send(json.dumps(
+                            {"method": "unsubscribeTokenTrade", "keys": list(self._pending_unsubs)}
+                        ))
+                        self._pending_unsubs.clear()
 
                     async for raw in ws:
                         try:
