@@ -57,15 +57,13 @@ class SolanaClient:
     def __init__(self):
         self._keypair = Keypair.from_base58_string(config.WALLET_PRIVATE_KEY)
         self._pubkey  = self._keypair.pubkey()
-        self._session: Optional[aiohttp.ClientSession] = None
+        connector = aiohttp.TCPConnector(
+            limit=20, ttl_dns_cache=300, enable_cleanup_closed=True,
+        )
+        self._session = aiohttp.ClientSession(connector=connector)
         log.info("Wallet: %s", self._pubkey)
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=20, ttl_dns_cache=300, enable_cleanup_closed=True,
-            )
-            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def close(self):
@@ -73,12 +71,28 @@ class SolanaClient:
             await self._session.close()
 
     async def warmup(self):
-        """Pre-warm connections to both endpoints."""
-        try:
-            await self._rpc({"method": "getHealth"})
-            log.info("Helius RPC warmed up")
-        except Exception as exc:
-            log.warning("Warmup failed (non-fatal): %s", exc)
+        """Pre-warm TCP connections to all endpoints before the first trade."""
+        async def _warm_helius():
+            try:
+                await self._rpc({"method": "getHealth"})
+                log.info("Helius RPC warmed up")
+            except Exception as exc:
+                log.warning("Helius warmup failed (non-fatal): %s", exc)
+
+        async def _warm_pumpportal():
+            try:
+                # HEAD-equivalent: tiny POST that will 400 but opens the TCP connection
+                async with self._session.post(
+                    PUMPPORTAL_TRADE_URL,
+                    json={},
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    await resp.read()
+            except Exception:
+                pass  # expected to fail — we just want the connection open
+            log.info("PumpPortal connection warmed up")
+
+        await asyncio.gather(_warm_helius(), _warm_pumpportal())
 
     # ── RPC ──────────────────────────────────────────────────────────────────
 
@@ -212,7 +226,7 @@ class SolanaClient:
         async with session.post(
             PUMPPORTAL_TRADE_URL,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=aiohttp.ClientTimeout(total=2),
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
