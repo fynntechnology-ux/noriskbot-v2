@@ -341,6 +341,7 @@ class SolanaClient:
           max_sol_cost = sol_lamports * (1 + slippage)
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        from solders.system_program import transfer, TransferParams
 
         mint = Pubkey.from_string(mint_str)
 
@@ -349,15 +350,11 @@ class SolanaClient:
         ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
 
         # ── 2. Tip to Helius Sender ────────────────────────────────────────────
-        tip_data = struct.pack("<I", 2) + struct.pack("<Q", config.SENDER_TIP_LAMPORTS)
-        ix_tip = Instruction(
-            program_id=_SYSTEM_PROGRAM,
-            accounts=[
-                AccountMeta(pubkey=self._pubkey,  is_signer=True,  is_writable=True),
-                AccountMeta(pubkey=_HELIUS_TIP,   is_signer=False, is_writable=True),
-            ],
-            data=bytes(tip_data),
-        )
+        ix_tip = transfer(TransferParams(
+            from_pubkey=self._pubkey,
+            to_pubkey=_HELIUS_TIP,
+            lamports=config.SENDER_TIP_LAMPORTS,
+        ))
 
         # ── 3. ATA create-if-needed ────────────────────────────────────────────
         assoc_user = Pubkey.from_string(accounts.assoc_user)
@@ -377,13 +374,11 @@ class SolanaClient:
         # ── 4. pump.fun buy ────────────────────────────────────────────────────
         tokens_out   = sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports)
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
-        slippage_u16 = int(config.SLIPPAGE * 100)
 
         buy_data = (
             _BUY_DISC
             + struct.pack("<Q", tokens_out)
             + struct.pack("<Q", max_sol_cost)
-            + struct.pack("<H", slippage_u16)
         )
 
         bc          = Pubkey.from_string(accounts.bonding_curve)
