@@ -178,13 +178,20 @@ class SolanaClient:
             log.debug("Jito %s (non-fatal): %s", region, exc)
 
     async def _send_jito(self, tx_bytes: bytes):
-        """Build tip tx, assemble bundle, blast all Jito regions in parallel."""
+        """Build tip tx using the same blockhash as main tx, blast all regions in parallel.
+
+        Bundle order: tip tx FIRST, main tx second — required by Jito.
+        Blockhash extracted from the already-signed main tx so both transactions match.
+        """
         try:
-            blockhash = await self._get_latest_blockhash()
+            # Extract the blockhash that PumpPortal baked into the main tx
+            main_tx   = VersionedTransaction.from_bytes(tx_bytes)
+            blockhash = str(main_tx.message.recent_blockhash())
+
             tip_bytes = self._build_tip_tx(blockhash)
             bundle = [
-                base58.b58encode(tx_bytes).decode(),
-                base58.b58encode(tip_bytes).decode(),
+                base58.b58encode(tip_bytes).decode(),  # tip FIRST
+                base58.b58encode(tx_bytes).decode(),   # main tx second
             ]
             session = await self._get_session()
             await asyncio.gather(*[
@@ -192,7 +199,7 @@ class SolanaClient:
                 for url in JITO_BUNDLE_URLS
             ])
         except Exception as exc:
-            log.debug("Jito bundle build (non-fatal): %s", exc)
+            log.debug("Jito bundle (non-fatal): %s", exc)
 
     # ── PumpPortal unsigned transaction builder ──────────────────────────────
 
@@ -247,12 +254,9 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_raw(tx_b64)
+        jito_coro = self._send_jito(tx_bytes) if config.USE_JITO else asyncio.sleep(0)
+        sig, _ = await asyncio.gather(self._send_raw(tx_b64), jito_coro)
         log.info("BUY  submitted  sig=%s", sig)
-
-        if config.USE_JITO:
-            asyncio.create_task(self._send_jito(tx_bytes))
-
         return sig
 
     async def sell_all(self, mint_str: str) -> str:
@@ -282,12 +286,9 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_raw(tx_b64)
+        jito_coro = self._send_jito(tx_bytes) if config.USE_JITO else asyncio.sleep(0)
+        sig, _ = await asyncio.gather(self._send_raw(tx_b64), jito_coro)
         log.info("SELL submitted  sig=%s", sig)
-
-        if config.USE_JITO:
-            asyncio.create_task(self._send_jito(tx_bytes))
-
         return sig
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
