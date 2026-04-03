@@ -15,8 +15,9 @@ SLIPPAGE:                float = float(os.getenv("SLIPPAGE", "0.5"))
 MAX_CONCURRENT_POSITIONS:int   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 
 # Solana transaction fees
-COMPUTE_UNIT_LIMIT:   int = int(os.getenv("COMPUTE_UNIT_LIMIT",   "200000"))
-COMPUTE_UNIT_PRICE:   int = int(os.getenv("COMPUTE_UNIT_PRICE",   "500000"))  # micro-lamports/CU
+COMPUTE_UNIT_LIMIT:       int = int(os.getenv("COMPUTE_UNIT_LIMIT",       "200000"))
+COMPUTE_UNIT_PRICE:       int = int(os.getenv("COMPUTE_UNIT_PRICE",       "500000"))  # micro-lamports/CU — buys
+SELL_COMPUTE_UNIT_PRICE:  int = int(os.getenv("SELL_COMPUTE_UNIT_PRICE",  "100000"))  # micro-lamports/CU — sells
 SENDER_TIP_LAMPORTS:      int = int(os.getenv("SENDER_TIP_LAMPORTS",      "1000000"))  # 0.001 SOL
 MIN_BUY_BUFFER_LAMPORTS:  int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",  "20000000")) # 0.02 SOL — covers pump.fun ~50% curve fee + tip
 

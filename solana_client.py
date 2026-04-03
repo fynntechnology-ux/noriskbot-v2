@@ -628,7 +628,7 @@ class SolanaClient:
             raise RuntimeError(f"No token balance for {mint_str}")
 
         priority_fee_sol = (
-            config.COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
+            config.SELL_COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
         )
 
         payload = {
@@ -648,8 +648,8 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_fast(tx_b64)
-        log.info("SELL submitted (fast)  sig=%s", sig)
+        sig = await self._send_via_rpc(tx_b64)
+        log.info("SELL submitted (rpc)  sig=%s", sig)
         return sig
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
