@@ -211,7 +211,6 @@ class PumpFunMonitor:
             "vtoken_raw":       watch.vtoken_raw,
             "token_accounts":   watch.accounts,
             "ata_created":      watch.ata_created,
-            "creator_pubkey":   watch.creator_pubkey,
         })
 
     # ------------------------------------------------------------------

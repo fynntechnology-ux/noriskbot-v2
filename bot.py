@@ -68,12 +68,11 @@ class PumpSnipeBot:
         log.info("Buying  %s  (age=%.1fs)", mint, signal["age_seconds"])
         try:
             order_id = await self._solana.buy(
-                mint_str        = mint,
-                sol_amount      = config.BUY_AMOUNT_SOL,
-                token_accounts  = signal.get("token_accounts"),
-                vsol_lamports   = signal.get("vsol_lamports"),
-                vtoken_raw      = signal.get("vtoken_raw"),
-                creator_pubkey  = signal.get("creator_pubkey"),
+                mint_str       = mint,
+                sol_amount     = config.BUY_AMOUNT_SOL,
+                token_accounts = signal.get("token_accounts"),
+                vsol_lamports  = signal.get("vsol_lamports"),
+                vtoken_raw     = signal.get("vtoken_raw"),
             )
             await self._positions.open(
                 mint=mint,
