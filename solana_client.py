@@ -635,7 +635,7 @@ class SolanaClient:
             "publicKey":        str(self._pubkey),
             "action":           "sell",
             "mint":             mint_str,
-            "amount":           raw_balance,
+            "amount":           "100%",
             "denominatedInSol": "false",
             "slippage":         int(config.SLIPPAGE * 100),
             "priorityFee":      priority_fee_sol,
