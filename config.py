@@ -17,13 +17,13 @@ MAX_CONCURRENT_POSITIONS:int   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 # Solana transaction fees
 COMPUTE_UNIT_LIMIT: int = int(os.getenv("COMPUTE_UNIT_LIMIT", "200000"))
 COMPUTE_UNIT_PRICE: int = int(os.getenv("COMPUTE_UNIT_PRICE", "500000"))  # micro-lamports/CU
-JITO_TIP_LAMPORTS:  int = int(os.getenv("JITO_TIP_LAMPORTS", "100000"))
+JITO_TIP_LAMPORTS:  int = int(os.getenv("JITO_TIP_LAMPORTS", "200000"))
 USE_JITO:          bool = os.getenv("USE_JITO", "true").lower() == "true"
 
 # RPC endpoints
-HELIUS_RPC_HTTP: str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-HELIUS_RPC_WS:   str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-JITO_BUNDLE_URL: str = "https://mainnet.block-engine.jito.labs.io/api/v1/bundles"
+HELIUS_RPC_HTTP:   str = "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_RPC_WS:     str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_SENDER_URL: str = "https://ams-sender.helius-rpc.com/fast"
 
 # PumpPortal WebSocket for new token events
 PUMPPORTAL_WS: str = "wss://pumpportal.fun/api/data"

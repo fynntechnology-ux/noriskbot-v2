@@ -160,7 +160,7 @@ class SolanaClient:
         return 0, 0.0
 
     async def _send_raw(self, tx_b64: str) -> str:
-        """Broadcast to Helius, returns signature."""
+        """Broadcast to Helius standard RPC, returns signature."""
         result = await self._rpc({
             "method": "sendTransaction",
             "params": [tx_b64, {
@@ -171,6 +171,28 @@ class SolanaClient:
             }],
         })
         return result
+
+    async def _send_via_sender(self, tx_b64: str) -> str:
+        """Submit via Helius Sender — staked connection, priority inclusion, no Jito bundle needed."""
+        async with self._session.post(
+            config.HELIUS_SENDER_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "sendTransaction",
+                "params":  [tx_b64, {
+                    "encoding":      "base64",
+                    "skipPreflight": True,
+                    "maxRetries":    0,
+                }],
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if "error" in data:
+            raise RuntimeError(f"Sender error: {data['error']}")
+        return data["result"]
 
     def _build_tip_tx(self, blockhash: str) -> bytes:
         """Build a legacy SOL transfer to a random Jito tip account."""
@@ -277,8 +299,7 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        jito_coro = self._send_jito(tx_bytes) if config.USE_JITO else asyncio.sleep(0)
-        sig, _ = await asyncio.gather(self._send_raw(tx_b64), jito_coro)
+        sig = await self._send_via_sender(tx_b64)
         log.info("BUY  submitted  sig=%s", sig)
         return sig
 
@@ -309,8 +330,7 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        jito_coro = self._send_jito(tx_bytes) if config.USE_JITO else asyncio.sleep(0)
-        sig, _ = await asyncio.gather(self._send_raw(tx_b64), jito_coro)
+        sig = await self._send_via_sender(tx_b64)
         log.info("SELL submitted  sig=%s", sig)
         return sig
 
