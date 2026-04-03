@@ -122,32 +122,41 @@ class SolanaClient:
         """
         Get token balance for our wallet.
         Returns (raw_amount, ui_amount) — ui_amount is human-readable (divided by 10^decimals).
+        All 4 ATA derivations are checked in parallel — takes one RPC round-trip instead of up to 4.
         """
-        from solders.pubkey import Pubkey
         TOKEN_PROGRAM    = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         TOKEN_2022       = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
         ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs")
         ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-
         mint = Pubkey.from_string(mint_str)
-        for tok_prog in [TOKEN_PROGRAM, TOKEN_2022]:
-            for ata_prog in [ASSOC_TOKEN_PROG, ASSOC_TOKEN_2022]:
-                ata, _ = Pubkey.find_program_address(
-                    [bytes(self._pubkey), bytes(tok_prog), bytes(mint)],
-                    ata_prog,
-                )
-                try:
-                    result = await self._rpc({
-                        "method": "getTokenAccountBalance",
-                        "params": [str(ata), {"commitment": "processed"}],
-                    }, timeout=3)
-                    val = result["value"]
-                    raw = int(val["amount"])
-                    if raw > 0:
-                        ui = float(val.get("uiAmount") or raw / 10 ** val.get("decimals", 6))
-                        return raw, ui
-                except Exception:
-                    pass
+
+        async def _try(tok_prog, ata_prog):
+            ata, _ = Pubkey.find_program_address(
+                [bytes(self._pubkey), bytes(tok_prog), bytes(mint)], ata_prog
+            )
+            try:
+                result = await self._rpc({
+                    "method": "getTokenAccountBalance",
+                    "params": [str(ata), {"commitment": "processed"}],
+                }, timeout=3)
+                val = result["value"]
+                raw = int(val["amount"])
+                if raw > 0:
+                    ui = float(val.get("uiAmount") or raw / 10 ** val.get("decimals", 6))
+                    return raw, ui
+            except Exception:
+                pass
+            return 0, 0.0
+
+        results = await asyncio.gather(
+            _try(TOKEN_PROGRAM, ASSOC_TOKEN_PROG),
+            _try(TOKEN_PROGRAM, ASSOC_TOKEN_2022),
+            _try(TOKEN_2022,    ASSOC_TOKEN_PROG),
+            _try(TOKEN_2022,    ASSOC_TOKEN_2022),
+        )
+        for raw, ui in results:
+            if raw > 0:
+                return raw, ui
         return 0, 0.0
 
     async def _send_raw(self, tx_b64: str) -> str:
