@@ -316,7 +316,8 @@ class SolanaClient:
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
         """Poll getSignatureStatuses until confirmed or timeout."""
-        deadline = time.time() + 60
+        timeout_s = 30 if label == "BUY" else 60
+        deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
                 result   = await self._rpc({
@@ -338,5 +339,5 @@ class SolanaClient:
                 raise
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
-            await asyncio.sleep(0.3)
-        raise RuntimeError(f"TX {sig[:16]} {label} timed out after 60s")
+            await asyncio.sleep(0.1)
+        raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
