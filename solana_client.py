@@ -572,7 +572,12 @@ class SolanaClient:
         return sig
 
     async def wait_for_order(self, sig: str, label: str = "") -> dict:
-        """Poll getSignatureStatuses until confirmed or timeout."""
+        """Poll getSignatureStatuses until confirmed or timeout.
+
+        For SELL transactions, also fetches the confirmed tx to read the
+        wallet's SOL delta (postBalance - preBalance for account[0]) so
+        position_manager can record accurate P&L.
+        """
         timeout_s = 30 if label == "BUY" else 60
         deadline  = time.time() + timeout_s
         while time.time() < deadline:
@@ -591,10 +596,38 @@ class SolanaClient:
                     conf = status.get("confirmationStatus", "")
                     if conf in ("processed", "confirmed", "finalized"):
                         log.info("TX %s… %s  (%s)", sig[:16], label, conf)
-                        return {"sig": sig, "status": conf, "output_amount": 0}
+                        output_amount = 0
+                        if label == "SELL":
+                            output_amount = await self._get_sol_received(sig)
+                        return {"sig": sig, "status": conf, "output_amount": output_amount}
             except RuntimeError:
                 raise
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
             await asyncio.sleep(0.1)
         raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
+
+    async def _get_sol_received(self, sig: str) -> int:
+        """
+        Fetch the confirmed tx and return the lamport increase for our wallet
+        (postBalance - preBalance for account index 0, the payer/signer).
+        Returns 0 on any error rather than crashing P&L accounting.
+        """
+        try:
+            tx = await self._rpc({
+                "method": "getTransaction",
+                "params": [sig, {
+                    "encoding":                      "json",
+                    "commitment":                    "confirmed",
+                    "maxSupportedTransactionVersion": 0,
+                }],
+            }, timeout=5)
+            meta = tx.get("meta", {})
+            pre  = meta.get("preBalances",  [])
+            post = meta.get("postBalances", [])
+            if pre and post:
+                delta = post[0] - pre[0]   # account[0] is always the fee-payer (our wallet)
+                return max(delta, 0)       # negative delta (e.g. failed tx) → report 0
+        except Exception as exc:
+            log.debug("_get_sol_received failed for %s: %s", sig[:16], exc)
+        return 0
