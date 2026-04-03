@@ -213,6 +213,7 @@ class PumpFunMonitor:
                         ))
                     except Exception:
                         pass
+            self._state.prune_name_registry()
 
     # ------------------------------------------------------------------
     # WebSocket stream (PumpPortal — new token discovery)

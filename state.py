@@ -104,6 +104,19 @@ class BotState:
     def remove_tracked(self, mint: str):
         self.tracked.pop(mint, None)
 
+    def prune_name_registry(self):
+        """Evict name_registry entries older than the 60s dup-detection window."""
+        cutoff = time.time() - 60
+        empty_keys = []
+        for key, mints in self.name_registry.items():
+            stale = [m for m, ts in mints.items() if ts < cutoff]
+            for m in stale:
+                del mints[m]
+            if not mints:
+                empty_keys.append(key)
+        for key in empty_keys:
+            del self.name_registry[key]
+
     def open_position(self, pos: PositionState):
         self.positions[pos.mint] = pos
         self.total_buys += 1
