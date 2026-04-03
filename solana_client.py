@@ -59,7 +59,8 @@ _BUY_DISC = bytes([0x66, 0x32, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
 #   [26] FgX1cdFq7khWeivEfHCULBA6ovtSr9djdAfJ9r3LvNST  CONST_17          buy[17] (writable)
 #   [28] pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ   PFEE_PROG         buy[15] (readonly)
 #   [29] 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt  CONST_14          buy[14] (readonly)
-_PUMP_ALT_ADDR = Pubkey.from_string("84gxtAAWToZ6xep3wrWsx8TEoLB7EBS9VrKkV9CtMdJi")
+_PUMP_ALT_ADDR  = Pubkey.from_string("84gxtAAWToZ6xep3wrWsx8TEoLB7EBS9VrKkV9CtMdJi")
+_PUMP_OLD_PROG  = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 
 
 @dataclass
@@ -562,11 +563,12 @@ class SolanaClient:
 
     async def buy(
         self,
-        mint_str:      str,
-        sol_amount:    float                = config.BUY_AMOUNT_SOL,
-        token_accounts: "TokenAccounts | None" = None,
-        vsol_lamports: int | None           = None,
-        vtoken_raw:    int | None           = None,
+        mint_str:        str,
+        sol_amount:      float                  = config.BUY_AMOUNT_SOL,
+        token_accounts:  "TokenAccounts | None" = None,
+        vsol_lamports:   int | None             = None,
+        vtoken_raw:      int | None             = None,
+        creator_pubkey:  str | None             = None,
     ) -> str:
         log.info("BUY  %s  %.4f SOL", mint_str, sol_amount)
 
@@ -584,6 +586,29 @@ class SolanaClient:
                 and vtoken_raw > 0
                 and vsol_lamports > 0):
             try:
+                # Derive creator_vault PDA from seeds ["vault", creator_pubkey, mint]
+                # to avoid relying on static[4] from prefetch tx (wrong since pump.fun update)
+                if creator_pubkey:
+                    try:
+                        creator_pk = Pubkey.from_string(creator_pubkey)
+                        mint_pk    = Pubkey.from_string(mint_str)
+                        vault_pda, _ = Pubkey.find_program_address(
+                            [b"vault", bytes(creator_pk), bytes(mint_pk)],
+                            _PUMP_OLD_PROG,
+                        )
+                        token_accounts = TokenAccounts(
+                            assoc_user          = token_accounts.assoc_user,
+                            bonding_curve       = token_accounts.bonding_curve,
+                            assoc_bonding_curve = token_accounts.assoc_bonding_curve,
+                            creator_vault       = str(vault_pda),
+                            pump_const1         = token_accounts.pump_const1,
+                            unk16               = token_accounts.unk16,
+                        )
+                        log.debug("creator_vault derived: %s", str(vault_pda))
+                    except Exception as exc:
+                        log.warning("creator_vault PDA derivation failed for %s: %s",
+                                    mint_str[:8], exc)
+
                 blockhash = await self._fresh_blockhash()
                 tx_bytes  = self._build_local_buy_tx(
                     mint_str      = mint_str,
