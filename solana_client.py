@@ -572,11 +572,9 @@ class SolanaClient:
 
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
 
-        # If vtoken_raw is missing, fetch it directly from the bonding curve
-        if vtoken_raw is None and token_accounts is not None:
-            vsol_lamports, vtoken_raw = await self._fetch_bc_reserves(
-                token_accounts.bonding_curve
-            ) or (vsol_lamports, None)
+        if vtoken_raw is None:
+            log.warning("vtoken_raw is None at buy time for %s — will use PumpPortal fallback",
+                        mint_str[:8])
 
         # Phase 2: build locally if we have all the data
         if (self._pump_alt is not None
