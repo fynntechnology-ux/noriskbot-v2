@@ -361,26 +361,43 @@ class SolanaClient:
                 log.warning("prefetch: unexpected account count %d for %s",
                             len(static), mint_str[:8])
                 return None
-            # Verify bonding curve is owned by 6EF8 — if not, it's a different
-            # pump.fun program version; return None so buy() uses PumpPortal fallback
+            # Fetch bonding curve account: verify ownership (6EF8) and derive
+            # creator_vault = PDA(["creator-vault", creator], 6EF8) from bc data.
+            # BondingCurve layout: [0:8] disc, [8:16] vToken, [16:24] vSol,
+            #   [24:32] realToken, [32:40] realSol, [40:48] totalSupply,
+            #   [48:49] complete (bool), [49:81] creator (Pubkey)
+            creator_vault_str = str(static[4])  # fallback to static slot
             try:
                 bc_info = await self._rpc({
                     "method": "getAccountInfo",
                     "params": [str(static[2]), {"encoding": "base64"}]
                 })
-                owner = ((bc_info or {}).get("value") or {}).get("owner", "")
+                bc_val = (bc_info or {}).get("value") or {}
+                owner  = bc_val.get("owner", "")
                 if owner and owner != str(_PUMP_OLD_PROG):
                     log.debug("prefetch: bc owned by %s (not 6EF8) for %s — PumpPortal fallback",
                               owner[:8], mint_str[:8])
                     return None
-            except Exception:
-                pass  # Non-blocking — proceed if check fails
+                bc_data_b64 = (bc_val.get("data") or [None])[0]
+                if bc_data_b64:
+                    import base64 as _b64
+                    bc_bytes = _b64.b64decode(bc_data_b64)
+                    if len(bc_bytes) >= 81:
+                        creator = Pubkey.from_bytes(bc_bytes[49:81])
+                        vault, _ = Pubkey.find_program_address(
+                            [b"creator-vault", bytes(creator)], _PUMP_OLD_PROG
+                        )
+                        creator_vault_str = str(vault)
+                        log.debug("prefetch: derived creator_vault=%s for %s",
+                                  creator_vault_str[:8], mint_str[:8])
+            except Exception as exc:
+                log.debug("prefetch: bc check failed for %s: %s", mint_str[:8], exc)
 
             return TokenAccounts(
                 assoc_user          = str(static[1]),
                 bonding_curve       = str(static[2]),
                 assoc_bonding_curve = str(static[3]),
-                creator_vault       = str(static[4]),
+                creator_vault       = creator_vault_str,
                 pump_const1         = str(static[5]),
                 unk16               = str(static[6]),
             )
