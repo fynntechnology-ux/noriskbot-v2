@@ -25,39 +25,39 @@ Two data feeds run in parallel — whichever fires first wins:
 
 | Feed | Source | What it does |
 |------|--------|-------------|
-| **Primary** | Helius Gatekeeper RPC (`accountSubscribe`) | Subscribes directly to the bonding curve account on-chain. Gets raw account data updates the moment a transaction lands. |
-| **Backup** | PumpPortal WebSocket (`subscribeTokenTrade`) | Receives trade events with `vSolInBondingCurve` field. Slightly slower but reliable fallback. |
+| **Primary** | Helius Gatekeeper (`accountSubscribe`) | Subscribes directly to the bonding curve account on-chain. Gets raw account data the moment a transaction lands. |
+| **Backup** | PumpPortal WebSocket (`subscribeTokenTrade`) | Receives trade events with `vSolInBondingCurve`. Slightly slower but reliable fallback. |
 
-New token discovery happens via **PumpPortal WebSocket** (`subscribeNewToken`). When a new token is detected, both feeds subscribe to it immediately.
+New token discovery happens via **PumpPortal WebSocket** (`subscribeNewToken`). When a new token is detected, both feeds subscribe immediately. Tokens on the `MAyhSmzX` program (different bonding curve) are automatically skipped.
 
 **Signal fires when all three conditions are true:**
-- `peak_vSol - 30 SOL >= 3 SOL` — token had real activity (not a dead launch)
-- `vSol - 30 SOL <= 0.01 SOL` — bonding curve is back near zero (everyone sold)
-- `token age <= 60 seconds` — token is still fresh (not a delayed dump)
+- `peak_vSol - 30 SOL >= 3 SOL` — token had real activity
+- `vSol - 30 SOL <= 0.01 SOL` — bonding curve is back near zero
+- `token age <= 60 seconds` — token is still fresh
 
 ---
 
 ### Buying
 
-Once a signal fires:
-1. The bot calls **PumpPortal's local trade API** to get an unsigned versioned transaction (v0) correctly structured for pump.fun's current on-chain program
-2. The transaction is signed locally with the wallet private key
-3. It is submitted simultaneously to:
-   - **Helius Gatekeeper RPC** — broadcasts to all validators
-   - **All 6 Jito block engine regions** (mainnet, Amsterdam, Frankfurt, NY, SLC, Tokyo) — sends a 2-transaction bundle (buy tx + SOL tip to Jito tip account) for priority inclusion
+Once a signal fires the bot builds a **local buy transaction** directly against the pump.fun `6EF8` program (no PumpPortal API call in the hot path):
 
-The bot holds a maximum of **3 positions** at once. If 3 are already open, new signals are ignored.
+1. Blockhash and fresh bonding curve reserves are fetched in parallel from Helius Gatekeeper
+2. AMM math computes expected tokens out from live on-chain virtual reserves
+3. Token account is created with `createAccountWithSeed` + `InitializeAccount3` (cheaper than ATA, ~70k CU total)
+4. Transaction is signed and submitted via **Helius Sender** (`/fast` endpoint) and Helius RPC in parallel — first response wins
+5. A 1,000,000 lamport tip is included in the tx for Helius Sender priority
 
 ---
 
 ### Selling
 
-After **60 seconds** (configurable), the position is automatically sold:
-1. The current token balance is fetched from the wallet's associated token account
-2. A sell transaction is built via PumpPortal and signed locally
-3. Submitted to Helius + all Jito regions the same way as the buy
+After **30 seconds** (configurable), the position is automatically sold via a **local sell transaction** directly against `6EF8`:
 
-If a sell fails, it retries up to **3 times** with a 3-second delay between attempts.
+1. Token balance is polled (up to 10s for settlement)
+2. Sell tx is built using the seed-derived token account as the source (same account created during buy)
+3. Submitted via Helius Gatekeeper RPC (no tip required — speed not critical for sells)
+
+If a sell fails, it retries up to **3 times** with a 3-second delay.
 
 ---
 
@@ -69,14 +69,15 @@ All settings are in `.env`:
 |----------|---------|-------------|
 | `WALLET_PRIVATE_KEY` | required | Base58 wallet private key |
 | `WALLET_ADDRESS` | required | Wallet public key |
-| `BUY_AMOUNT_SOL` | `0.03` | How much SOL to spend per buy |
-| `HOLD_TIME_SECONDS` | `60` | How long to hold before auto-sell |
+| `BUY_AMOUNT_SOL` | `0.06` | SOL to spend per buy |
+| `HOLD_TIME_SECONDS` | `30` | Seconds to hold before auto-sell |
 | `MAX_TOKEN_AGE_SECONDS` | `60` | Ignore tokens older than this |
-| `SLIPPAGE` | `0.5` | Slippage tolerance (50%) |
-| `MAX_CONCURRENT_POSITIONS` | `3` | Max open positions at once |
-| `COMPUTE_UNIT_PRICE` | `500000` | Priority fee in micro-lamports/CU |
-| `JITO_TIP_LAMPORTS` | `100000` | Jito tip per transaction (0.0001 SOL) |
-| `USE_JITO` | `true` | Enable/disable Jito bundle submission |
+| `SLIPPAGE` | `0.10` | Slippage tolerance (10%) |
+| `MAX_CONCURRENT_POSITIONS` | `5` | Max open positions at once |
+| `COMPUTE_UNIT_PRICE` | `20000` | Priority fee micro-lamports/CU (buys) |
+| `COMPUTE_UNIT_LIMIT` | `85000` | CU limit for buy transactions |
+| `SELL_COMPUTE_UNIT_PRICE` | `100000` | Priority fee micro-lamports/CU (sells) |
+| `SENDER_TIP_LAMPORTS` | `1000000` | Helius Sender tip per buy (0.001 SOL) |
 
 ---
 
@@ -102,9 +103,19 @@ main.py
  ├── bot.py              — orchestrates signals → buys → position tracking
  ├── pumpfun_monitor.py  — dual-feed signal detection (PumpPortal + Helius)
  ├── helius_feed.py      — Helius Gatekeeper accountSubscribe WebSocket
- ├── solana_client.py    — transaction building, signing, Helius + Jito submission
+ ├── solana_client.py    — local tx building/signing, Helius Sender + RPC submission
  ├── position_manager.py — tracks open positions, fires auto-sell timer
  ├── config.py           — all settings from .env
  ├── state.py            — shared bot state (positions, event log)
  └── server.py           — dashboard web server
 ```
+
+---
+
+## Key implementation details
+
+- **Token accounts** use `createAccountWithSeed(seed=mint[:8])` instead of ATA program — saves ~18k CU per buy
+- **Buy tx structure**: `[SetCULimit, SetCUPrice, createAccountWithSeed, InitializeAccount3, Buy, Tip]` — 17 accounts, ~70k CU consumed
+- **Sell tx structure**: `[SetCULimit, SetCUPrice, Sell]` — 16 accounts, ~56k CU consumed
+- **Fresh reserves**: bonding curve reserves are fetched on-chain at buy time (concurrent with blockhash) to avoid stale AMM calculations from PumpPortal
+- **Program filter**: tokens using `MAyhSmzX` (new pump.fun wrapper) are skipped — different account layout
