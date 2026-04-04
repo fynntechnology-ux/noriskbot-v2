@@ -509,13 +509,11 @@ class SolanaClient:
         # ── AMM calculation ────────────────────────────────────────────────────
         tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports))
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
-        slippage_bps = int(config.SLIPPAGE * 10000)
 
         buy_data = (
             _BUY_DISC
             + struct.pack("<Q", tokens_out)
             + struct.pack("<Q", max_sol_cost)
-            + struct.pack("<H", slippage_bps)
         )
 
         # ── Buy instruction — all 18 accounts by full address, no ALT ─────────
