@@ -66,12 +66,13 @@ _PUMP_OLD_PROG  = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6
 @dataclass
 class TokenAccounts:
     """Per-token on-chain accounts needed to build the buy instruction locally."""
-    assoc_user:          str  # static[1] → buy slot[ 5]
-    bonding_curve:       str  # static[2] → buy slot[ 3]
-    assoc_bonding_curve: str  # static[3] → buy slot[ 4]
-    creator_vault:       str  # static[4] → buy slot[ 9]
-    pump_const1:         str  # static[5] → buy slot[13] — per-token, NOT a global constant
-    unk16:               str  # static[6] → buy slot[16]
+    assoc_user:          str    # static[1] → buy slot[ 5]
+    bonding_curve:       str    # static[2] → buy slot[ 3]
+    assoc_bonding_curve: str    # static[3] → buy slot[ 4]
+    creator_vault:       str    # static[4] → buy slot[ 9]
+    pump_const1:         str    # static[5] → buy slot[13] — per-token, NOT a global constant
+    unk16:               str    # static[6] → buy slot[16]
+    buy_disc:            bytes  # first 8 bytes of buy ix data — extracted from prefetch tx
 
 
 class SolanaClient:
@@ -360,6 +361,9 @@ class SolanaClient:
                 log.warning("prefetch: unexpected account count %d for %s",
                             len(static), mint_str[:8])
                 return None
+            buy_ix   = tx.message.instructions[-1]  # buy is always the last instruction
+            buy_disc = bytes(buy_ix.data[:8])
+            log.debug("prefetch buy_disc=%s for %s", buy_disc.hex(), mint_str[:8])
             return TokenAccounts(
                 assoc_user          = str(static[1]),
                 bonding_curve       = str(static[2]),
@@ -367,6 +371,7 @@ class SolanaClient:
                 creator_vault       = str(static[4]),
                 pump_const1         = str(static[5]),
                 unk16               = str(static[6]),
+                buy_disc            = buy_disc,
             )
         except Exception as exc:
             log.warning("prefetch: failed to parse tx for %s: %s", mint_str[:8], exc)
@@ -511,7 +516,7 @@ class SolanaClient:
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
 
         buy_data = (
-            _BUY_DISC
+            accounts.buy_disc
             + struct.pack("<Q", tokens_out)
             + struct.pack("<Q", max_sol_cost)
         )
