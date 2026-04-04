@@ -69,7 +69,8 @@ class PositionManager:
                 self._state.log("error", pos.mint, pos.symbol,
                                 f"sell attempt {attempt} failed: {exc}")
                 if attempt < 3:
-                    await asyncio.sleep(3)
+                    delay = 10 if "-32429" in str(exc) else 3
+                    await asyncio.sleep(delay)
 
         self._state.close_position(pos.mint, 0.0, success=False)
         log.error("All sell attempts failed for %s", pos.mint)
