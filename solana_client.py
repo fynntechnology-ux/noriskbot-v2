@@ -512,8 +512,8 @@ class SolanaClient:
         )
 
         # ── AMM calculation ────────────────────────────────────────────────────
-        tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports))
-        max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
+        tokens_out   = int(vtoken_raw * sol_lamports // (vsol_lamports + sol_lamports))
+        max_sol_cost = sol_lamports * 2  # generous ceiling — actual spend determined by AMM
 
         buy_data = (
             accounts.buy_disc
