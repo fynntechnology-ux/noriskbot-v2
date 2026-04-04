@@ -479,7 +479,7 @@ class SolanaClient:
         _CONST12    = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
         _CONST14    = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         _PFEE_PROG  = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
-        _FEE_CONFIG = Pubkey.from_string("7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4g6")
+        _FEE_CONFIG = Pubkey.from_string("7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4a6")
 
         # ── Compute budget ─────────────────────────────────────────────────────
         ix_cu_limit = set_compute_unit_limit(config.COMPUTE_UNIT_LIMIT)
