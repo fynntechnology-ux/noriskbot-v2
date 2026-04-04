@@ -523,7 +523,7 @@ class SolanaClient:
 
         # ── Buy instruction — all 18 accounts by full address, no ALT ─────────
         ix_buy = Instruction(
-            program_id=_PUMP_NEW_PROG,
+            program_id=_PUMP_OLD_PROG,
             accounts=[
                 AccountMeta(_GLOBAL,        False, False),  # [0]  global
                 AccountMeta(_FEE_RECIP,     False, True),   # [1]  fee recipient (writable)
