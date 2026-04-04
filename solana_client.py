@@ -34,6 +34,7 @@ PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 # ── pump.fun constant addresses ───────────────────────────────────────────────
 
 _PUMP_NEW_PROG    = Pubkey.from_string("FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe")
+_TOKEN_PROG       = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 _TOKEN_2022       = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 _ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs")
 _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
@@ -381,14 +382,14 @@ class SolanaClient:
             ix_cu_limit = set_compute_unit_limit(25_000)
             ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
             ix_ata = Instruction(
-                program_id=_ASSOC_TOKEN_2022,
+                program_id=_ASSOC_TOKEN_PROG,
                 accounts=[
                     AccountMeta(pubkey=self._pubkey, is_signer=True,  is_writable=True),
                     AccountMeta(pubkey=assoc_user,   is_signer=False, is_writable=True),
                     AccountMeta(pubkey=self._pubkey, is_signer=False, is_writable=False),
                     AccountMeta(pubkey=mint,         is_signer=False, is_writable=False),
                     AccountMeta(pubkey=_SYSTEM_PROGRAM,  is_signer=False, is_writable=False),
-                    AccountMeta(pubkey=_TOKEN_2022,      is_signer=False, is_writable=False),
+                    AccountMeta(pubkey=_TOKEN_PROG,      is_signer=False, is_writable=False),
                 ],
                 data=b'\x01',
             )
@@ -494,14 +495,14 @@ class SolanaClient:
 
         # ── ATA create-if-needed ───────────────────────────────────────────────
         ix_ata = Instruction(
-            program_id=_ASSOC_TOKEN_2022,
+            program_id=_ASSOC_TOKEN_PROG,
             accounts=[
                 AccountMeta(pubkey=self._pubkey,    is_signer=True,  is_writable=True),
                 AccountMeta(pubkey=assoc_user,      is_signer=False, is_writable=True),
                 AccountMeta(pubkey=self._pubkey,    is_signer=False, is_writable=False),
                 AccountMeta(pubkey=mint,            is_signer=False, is_writable=False),
                 AccountMeta(pubkey=_SYSTEM_PROGRAM, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=_TOKEN_2022,     is_signer=False, is_writable=False),
+                AccountMeta(pubkey=_TOKEN_PROG,     is_signer=False, is_writable=False),
             ],
             data=b'\x01',
         )
@@ -528,7 +529,7 @@ class SolanaClient:
                 AccountMeta(assoc_user,     False, True),   # [5]  user ATA (writable)
                 AccountMeta(self._pubkey,   True,  True),   # [6]  user (signer, writable)
                 AccountMeta(_SYSTEM_PROGRAM, False, False), # [7]  system program
-                AccountMeta(_TOKEN_2022,    False, False),  # [8]  token-2022 program
+                AccountMeta(_TOKEN_PROG,    False, False),  # [8]  token program
                 AccountMeta(cvlt,           False, True),   # [9]  creator vault (writable)
                 AccountMeta(_CONST10,       False, False),  # [10]
                 AccountMeta(_PUMP_OLD_PROG, False, False),  # [11] pump old program
