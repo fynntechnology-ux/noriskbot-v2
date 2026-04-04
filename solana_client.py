@@ -614,7 +614,15 @@ class SolanaClient:
         return sig
 
     async def sell_all(self, mint_str: str) -> str:
-        raw_balance, ui_balance = await self._get_token_balance(mint_str)
+        # Poll up to 10s for balance to settle after buy confirmation lag
+        raw_balance, ui_balance = 0, 0.0
+        for _ in range(10):
+            raw_balance, ui_balance = await self._get_token_balance(mint_str)
+            if raw_balance > 0:
+                break
+            log.debug("Waiting for token balance to settle for %s…", mint_str[:8])
+            await asyncio.sleep(1)
+
         if raw_balance == 0:
             raise RuntimeError(f"No token balance for {mint_str}")
 
