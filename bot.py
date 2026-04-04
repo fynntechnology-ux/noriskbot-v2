@@ -99,8 +99,11 @@ class PumpSnipeBot:
             if actual > 0 and mint in self._state.positions:
                 self._state.positions[mint].sol_spent = actual
         except Exception as exc:
-            self._state.log("warn", mint, symbol, f"buy confirm failed: {exc}")
-            log.warning("Buy confirmation failed for %s: %s", mint, exc)
+            self._state.log("error", mint, symbol, f"buy failed on-chain: {exc}")
+            log.error("Buy failed on-chain for %s: %s", mint, exc)
+            # Close the phantom position so sell_all isn't attempted on tokens we don't hold
+            if mint in self._state.positions:
+                self._state.close_position(mint, 0.0, success=False)
 
     async def run(self):
         log.info("=" * 60)

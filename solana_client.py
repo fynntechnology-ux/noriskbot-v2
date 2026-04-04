@@ -361,6 +361,21 @@ class SolanaClient:
                 log.warning("prefetch: unexpected account count %d for %s",
                             len(static), mint_str[:8])
                 return None
+            # Verify bonding curve is owned by 6EF8 — if not, it's a different
+            # pump.fun program version; return None so buy() uses PumpPortal fallback
+            try:
+                bc_info = await self._rpc({
+                    "method": "getAccountInfo",
+                    "params": [str(static[2]), {"encoding": "base64"}]
+                })
+                owner = ((bc_info or {}).get("value") or {}).get("owner", "")
+                if owner and owner != str(_PUMP_OLD_PROG):
+                    log.debug("prefetch: bc owned by %s (not 6EF8) for %s — PumpPortal fallback",
+                              owner[:8], mint_str[:8])
+                    return None
+            except Exception:
+                pass  # Non-blocking — proceed if check fails
+
             return TokenAccounts(
                 assoc_user          = str(static[1]),
                 bonding_curve       = str(static[2]),
