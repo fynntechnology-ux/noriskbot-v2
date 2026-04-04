@@ -22,6 +22,7 @@ class PositionState:
     sell_order_id: str | None = None
     closed: bool = False
     sell_result: str = ""        # "ok" | "failed"
+    token_accounts: object = None  # TokenAccounts — stored for local sell tx
 
 
 @dataclass

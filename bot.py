@@ -82,6 +82,7 @@ class PumpSnipeBot:
                 buy_order_id=order_id,
                 bonding_at_buy=signal["bonding_pct"],
                 peak_bonding=signal["peak_bonding_pct"],
+                token_accounts=signal.get("token_accounts"),
             )
             asyncio.create_task(self._solana.refresh_balance())
             asyncio.create_task(self._confirm_buy(order_id, mint, symbol))

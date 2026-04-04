@@ -26,7 +26,8 @@ class PositionManager:
         return mint in self._state.positions
 
     async def open(self, mint: str, symbol: str, name: str,
-                   buy_order_id: str, bonding_at_buy: float, peak_bonding: float):
+                   buy_order_id: str, bonding_at_buy: float, peak_bonding: float,
+                   token_accounts=None):
         pos = PositionState(
             mint=mint,
             symbol=symbol,
@@ -36,6 +37,7 @@ class PositionManager:
             sol_spent=config.BUY_AMOUNT_SOL,
             bonding_at_buy=bonding_at_buy,
             peak_bonding=peak_bonding,
+            token_accounts=token_accounts,
         )
         self._state.open_position(pos)
         self._state.log("buy", mint, symbol,
@@ -53,7 +55,7 @@ class PositionManager:
 
         for attempt in range(1, 4):
             try:
-                order_id, tx_b64 = await self._solana.sell_all(pos.mint)
+                order_id, tx_b64 = await self._solana.sell_all(pos.mint, pos.token_accounts)
                 pos.sell_order_id = order_id
                 result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64)
                 sol_back = float(result.get("output_amount", 0)) / config.LAMPORTS_PER_SOL

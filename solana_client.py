@@ -43,8 +43,9 @@ _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 # Helius Sender tip recipient — must be one of the addresses Sender accepts
 _HELIUS_TIP       = Pubkey.from_string("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT")
 
-# Buy instruction discriminator (8 bytes)
-_BUY_DISC = bytes([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
+# Buy / Sell instruction discriminators (sha256("global:buy/sell")[:8])
+_BUY_DISC  = bytes([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
+_SELL_DISC = bytes([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad])
 
 # pump.fun Address Lookup Table — contains all global program/account constants.
 # Fetched once at startup; passed to MessageV0.try_compile so the compiler can
@@ -62,6 +63,10 @@ _BUY_DISC = bytes([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
 #   [29] 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt  CONST_14          buy[14] (readonly)
 _PUMP_ALT_ADDR  = Pubkey.from_string("84gxtAAWToZ6xep3wrWsx8TEoLB7EBS9VrKkV9CtMdJi")
 _PUMP_OLD_PROG  = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+
+
+class WrongProgramError(Exception):
+    """Raised when a token's bonding curve is owned by an unsupported program."""
 
 
 @dataclass
@@ -202,41 +207,31 @@ class SolanaClient:
         """
         Get token balance for our wallet.
         Returns (raw_amount, ui_amount) — ui_amount is human-readable (divided by 10^decimals).
-        All 4 ATA derivations are checked in parallel — takes one RPC round-trip instead of up to 4.
+        Uses getTokenAccountsByOwner to find the balance regardless of how the token
+        account was created (ATA or seed-derived).
         """
-        TOKEN_PROGRAM    = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        TOKEN_2022       = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
-        ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs")
-        ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-        mint = Pubkey.from_string(mint_str)
-
-        async def _try(tok_prog, ata_prog):
-            ata, _ = Pubkey.find_program_address(
-                [bytes(self._pubkey), bytes(tok_prog), bytes(mint)], ata_prog
-            )
-            try:
-                result = await self._rpc({
-                    "method": "getTokenAccountBalance",
-                    "params": [str(ata), {"commitment": "processed"}],
-                }, timeout=3)
-                val = result["value"]
-                raw = int(val["amount"])
+        try:
+            result = await self._rpc({
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    str(self._pubkey),
+                    {"mint": mint_str},
+                    {"encoding": "jsonParsed", "commitment": "processed"},
+                ],
+            }, timeout=5)
+            for acct in (result or {}).get("value", []):
+                info = (acct.get("account", {})
+                            .get("data", {})
+                            .get("parsed", {})
+                            .get("info", {}))
+                tok_amt = info.get("tokenAmount", {})
+                raw = int(tok_amt.get("amount", 0))
                 if raw > 0:
-                    ui = float(val.get("uiAmount") or raw / 10 ** val.get("decimals", 6))
+                    ui = float(tok_amt.get("uiAmount") or
+                               raw / 10 ** tok_amt.get("decimals", 6))
                     return raw, ui
-            except Exception:
-                pass
-            return 0, 0.0
-
-        results = await asyncio.gather(
-            _try(TOKEN_PROGRAM, ASSOC_TOKEN_PROG),
-            _try(TOKEN_PROGRAM, ASSOC_TOKEN_2022),
-            _try(TOKEN_2022,    ASSOC_TOKEN_PROG),
-            _try(TOKEN_2022,    ASSOC_TOKEN_2022),
-        )
-        for raw, ui in results:
-            if raw > 0:
-                return raw, ui
+        except Exception:
+            pass
         return 0, 0.0
 
     async def _send_via_rpc(self, tx_b64: str) -> str:
@@ -375,9 +370,9 @@ class SolanaClient:
                 bc_val = (bc_info or {}).get("value") or {}
                 owner  = bc_val.get("owner", "")
                 if owner and owner != str(_PUMP_OLD_PROG):
-                    log.debug("prefetch: bc owned by %s (not 6EF8) for %s — PumpPortal fallback",
+                    log.debug("prefetch: bc owned by %s (not 6EF8) for %s — skipping",
                               owner[:8], mint_str[:8])
-                    return None
+                    raise WrongProgramError(owner)
                 bc_data_b64 = (bc_val.get("data") or [None])[0]
                 if bc_data_b64:
                     import base64 as _b64
@@ -390,6 +385,8 @@ class SolanaClient:
                         creator_vault_str = str(vault)
                         log.debug("prefetch: derived creator_vault=%s for %s",
                                   creator_vault_str[:8], mint_str[:8])
+            except WrongProgramError:
+                raise
             except Exception as exc:
                 log.debug("prefetch: bc check failed for %s: %s", mint_str[:8], exc)
 
@@ -401,6 +398,8 @@ class SolanaClient:
                 pump_const1         = str(static[5]),
                 unk16               = str(static[6]),
             )
+        except WrongProgramError:
+            raise
         except Exception as exc:
             log.warning("prefetch: failed to parse tx for %s: %s", mint_str[:8], exc)
             return None
@@ -489,15 +488,19 @@ class SolanaClient:
         Instructions:
           1. SetComputeUnitLimit
           2. SetComputeUnitPrice
-          3. SystemProgram::transfer  (tip to Helius Sender)
-          4. AssociatedTokenAccount create-if-needed  (user's token ATA)
-          5. pump.fun buy  (18 accounts)
+          3. SystemProgram::createAccountWithSeed  (create user token account)
+          4. Token-2022::InitializeAccount3        (init token account)
+          5. pump.fun buy  (17 accounts)
+          6. SystemProgram::transfer  (tip to Helius Sender)
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
-        from solders.system_program import transfer, TransferParams
+        from solders.system_program import transfer, TransferParams, create_account_with_seed, CreateAccountWithSeedParams
 
         mint        = Pubkey.from_string(mint_str)
-        assoc_user  = Pubkey.from_string(accounts.assoc_user)
+        # Token account derived via seed — same method as competitor, no ATA program needed.
+        # seed = first 8 chars of mint string; address = createWithSeed(wallet, seed, Token-2022)
+        token_seed  = mint_str[:8]
+        user_token  = Pubkey.create_with_seed(self._pubkey, token_seed, _TOKEN_2022)
         bc          = Pubkey.from_string(accounts.bonding_curve)
         abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
         cvlt        = Pubkey.from_string(accounts.creator_vault)
@@ -505,37 +508,39 @@ class SolanaClient:
         unk16       = Pubkey.from_string(accounts.unk16)
 
         # Global constants — hardcoded by address, immune to ALT index drift
-        _GLOBAL     = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
-        _FEE_RECIP  = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
-        _CONST10    = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
-        _CONST12    = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
-        _CONST14    = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
-        _PFEE_PROG  = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
-        _FEE_CONFIG = Pubkey.from_string("7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4a6")
+        _GLOBAL    = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        _FEE_RECIP = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+        _CONST10   = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+        _CONST12   = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
+        _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
+        _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 
         # ── Compute budget ─────────────────────────────────────────────────────
         ix_cu_limit = set_compute_unit_limit(config.COMPUTE_UNIT_LIMIT)
         ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
 
-        # ── Tip to Helius Sender ───────────────────────────────────────────────
-        ix_tip = transfer(TransferParams(
+        # ── Create token account via seed (cheaper than ATA program) ──────────
+        # Min rent for a 165-byte standard token account
+        TOKEN_ACCT_RENT = 2039280
+        ix_create = create_account_with_seed(CreateAccountWithSeedParams(
             from_pubkey=self._pubkey,
-            to_pubkey=_HELIUS_TIP,
-            lamports=config.SENDER_TIP_LAMPORTS,
+            to_pubkey=user_token,
+            base=self._pubkey,
+            seed=token_seed,
+            lamports=TOKEN_ACCT_RENT,
+            space=165,
+            owner=_TOKEN_2022,
         ))
 
-        # ── ATA create-if-needed ───────────────────────────────────────────────
-        ix_ata = Instruction(
-            program_id=_ASSOC_TOKEN_2022,
+        # ── Initialize token account (Token-2022 InitializeAccount3) ──────────
+        # Discriminator 18, then 32-byte owner pubkey in data; no ATA overhead
+        ix_init = Instruction(
+            program_id=_TOKEN_2022,
             accounts=[
-                AccountMeta(pubkey=self._pubkey,    is_signer=True,  is_writable=True),
-                AccountMeta(pubkey=assoc_user,      is_signer=False, is_writable=True),
-                AccountMeta(pubkey=self._pubkey,    is_signer=False, is_writable=False),
-                AccountMeta(pubkey=mint,            is_signer=False, is_writable=False),
-                AccountMeta(pubkey=_SYSTEM_PROGRAM, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=_TOKEN_2022,     is_signer=False, is_writable=False),
+                AccountMeta(pubkey=user_token, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=mint,       is_signer=False, is_writable=False),
             ],
-            data=b'\x01',
+            data=bytes([18]) + bytes(self._pubkey),
         )
 
         # ── AMM calculation ────────────────────────────────────────────────────
@@ -548,35 +553,127 @@ class SolanaClient:
             + struct.pack("<Q", max_sol_cost)
         )
 
-        # ── Buy instruction — all 18 accounts by full address, no ALT ─────────
+        # ── Buy instruction — 17 accounts, no _FEE_CONFIG, unk16 readonly ─────
         ix_buy = Instruction(
             program_id=_PUMP_OLD_PROG,
             accounts=[
-                AccountMeta(_GLOBAL,        False, False),  # [0]  global
-                AccountMeta(_FEE_RECIP,     False, True),   # [1]  fee recipient (writable)
-                AccountMeta(mint,           False, False),  # [2]  mint
-                AccountMeta(bc,             False, True),   # [3]  bonding curve (writable)
-                AccountMeta(abc,            False, True),   # [4]  assoc bonding curve (writable)
-                AccountMeta(assoc_user,     False, True),   # [5]  user ATA (writable)
-                AccountMeta(self._pubkey,   True,  True),   # [6]  user (signer, writable)
-                AccountMeta(_SYSTEM_PROGRAM, False, False), # [7]  system program
-                AccountMeta(_TOKEN_2022,    False, False),  # [8]  token program (Token-2022)
-                AccountMeta(cvlt,           False, True),   # [9]  creator vault (writable)
-                AccountMeta(_CONST10,       False, False),  # [10]
-                AccountMeta(_PUMP_OLD_PROG, False, False),  # [11] pump old program
-                AccountMeta(_CONST12,       False, False),  # [12]
-                AccountMeta(pump_const1,    False, True),   # [13] per-token (writable)
-                AccountMeta(_CONST14,       False, False),  # [14]
-                AccountMeta(_PFEE_PROG,     False, False),  # [15] pfee program
-                AccountMeta(unk16,          False, True),   # [16] per-token (writable)
-                AccountMeta(_FEE_CONFIG,    False, True),   # [17] fee config (writable, Sep 2025)
+                AccountMeta(_GLOBAL,         False, False),  # [0]  global
+                AccountMeta(_FEE_RECIP,      False, True),   # [1]  fee recipient (writable)
+                AccountMeta(mint,            False, False),  # [2]  mint
+                AccountMeta(bc,              False, True),   # [3]  bonding curve (writable)
+                AccountMeta(abc,             False, True),   # [4]  assoc bonding curve (writable)
+                AccountMeta(user_token,      False, True),   # [5]  user token account (writable)
+                AccountMeta(self._pubkey,    True,  True),   # [6]  user (signer, writable)
+                AccountMeta(_SYSTEM_PROGRAM, False, False),  # [7]  system program
+                AccountMeta(_TOKEN_2022,     False, False),  # [8]  token program (Token-2022)
+                AccountMeta(cvlt,            False, True),   # [9]  creator vault (writable)
+                AccountMeta(_CONST10,        False, False),  # [10]
+                AccountMeta(_PUMP_OLD_PROG,  False, False),  # [11] pump program
+                AccountMeta(_CONST12,        False, False),  # [12]
+                AccountMeta(pump_const1,     False, True),   # [13] per-token (writable)
+                AccountMeta(_CONST14,        False, False),  # [14]
+                AccountMeta(_PFEE_PROG,      False, False),  # [15] pfee program
+                AccountMeta(unk16,           False, False),  # [16] per-token (readonly)
             ],
             data=bytes(buy_data),
         )
 
+        # ── Tip to Helius Sender — placed last (after buy) ────────────────────
+        ix_tip = transfer(TransferParams(
+            from_pubkey=self._pubkey,
+            to_pubkey=_HELIUS_TIP,
+            lamports=config.SENDER_TIP_LAMPORTS,
+        ))
+
         # ── Legacy message — no ALT, immune to index drift ────────────────────
         msg = Message.new_with_blockhash(
-            [ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
+            [ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip],
+            self._pubkey,
+            Hash.from_string(blockhash),
+        )
+        sig = self._keypair.sign_message(bytes(msg))
+        return bytes(Transaction.populate(msg, [sig]))
+
+    def _build_local_sell_tx(
+        self,
+        mint_str:   str,
+        accounts:   TokenAccounts,
+        raw_amount: int,
+        blockhash:  str,
+    ) -> bytes:
+        """
+        Build and sign a pump.fun sell transaction locally using Legacy format.
+
+        6EF8 sell CPI account order (16 accounts, verified from on-chain inner ix):
+          [0]  global           readonly
+          [1]  feeRecipient     writable
+          [2]  mint             readonly
+          [3]  bondingCurve     writable
+          [4]  assocBondingCurve writable
+          [5]  userToken        writable  ← seed-derived account (source)
+          [6]  user             writable  signer
+          [7]  systemProgram    readonly
+          [8]  creatorVault     writable  (swapped vs buy — [9] in buy)
+          [9]  tokenProgram     readonly  (swapped vs buy — [8] in buy)
+          [10] eventAuthority   readonly
+          [11] program          readonly
+          [12] CONST14          readonly
+          [13] pfeeProgram      readonly
+          [14] unk16            writable
+          [15] pump_const1      writable
+
+        Instructions: SetCULimit, SetCUPrice, sell, tip
+        """
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+
+        mint        = Pubkey.from_string(mint_str)
+        user_token  = Pubkey.create_with_seed(self._pubkey, mint_str[:8], _TOKEN_2022)
+        bc          = Pubkey.from_string(accounts.bonding_curve)
+        abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
+        cvlt        = Pubkey.from_string(accounts.creator_vault)
+        pump_const1 = Pubkey.from_string(accounts.pump_const1)
+        unk16       = Pubkey.from_string(accounts.unk16)
+
+        _GLOBAL    = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        _FEE_RECIP = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+        _CONST10   = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+        _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
+        _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+
+        ix_cu_limit = set_compute_unit_limit(60_000)
+        ix_cu_price = set_compute_unit_price(config.SELL_COMPUTE_UNIT_PRICE)
+
+        sell_data = (
+            _SELL_DISC
+            + struct.pack("<Q", raw_amount)  # tokens to sell
+            + struct.pack("<Q", 0)           # min_sol_output — accept any
+        )
+
+        ix_sell = Instruction(
+            program_id=_PUMP_OLD_PROG,
+            accounts=[
+                AccountMeta(_GLOBAL,         False, False),  # [0]  global
+                AccountMeta(_FEE_RECIP,      False, True),   # [1]  fee recipient (writable)
+                AccountMeta(mint,            False, False),  # [2]  mint
+                AccountMeta(bc,              False, True),   # [3]  bonding curve (writable)
+                AccountMeta(abc,             False, True),   # [4]  assoc bonding curve (writable)
+                AccountMeta(user_token,      False, True),   # [5]  user token account (writable, source)
+                AccountMeta(self._pubkey,    True,  True),   # [6]  user (signer, writable)
+                AccountMeta(_SYSTEM_PROGRAM, False, False),  # [7]  system program
+                AccountMeta(cvlt,            False, True),   # [8]  creator vault (writable)
+                AccountMeta(_TOKEN_2022,     False, False),  # [9]  token program
+                AccountMeta(_CONST10,        False, False),  # [10] event authority
+                AccountMeta(_PUMP_OLD_PROG,  False, False),  # [11] program self-ref
+                AccountMeta(_CONST14,        False, False),  # [12]
+                AccountMeta(_PFEE_PROG,      False, False),  # [13] pfee program
+                AccountMeta(unk16,           False, True),   # [14] per-token (writable)
+                AccountMeta(pump_const1,     False, True),   # [15] per-token (writable)
+            ],
+            data=bytes(sell_data),
+        )
+
+        msg = Message.new_with_blockhash(
+            [ix_cu_limit, ix_cu_price, ix_sell],
             self._pubkey,
             Hash.from_string(blockhash),
         )
@@ -597,55 +694,29 @@ class SolanaClient:
 
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
 
-        if vtoken_raw is None:
-            log.warning("vtoken_raw is None at buy time for %s — will use PumpPortal fallback",
-                        mint_str[:8])
+        # Require all local tx data — no fallback, PumpPortal txs can't compete
+        missing = []
+        if token_accounts is None:  missing.append("token_accounts")
+        if vsol_lamports  is None:  missing.append("vsol_lamports")
+        if not vtoken_raw:          missing.append("vtoken_raw")
+        if missing:
+            raise RuntimeError(f"missing prefetch data ({', '.join(missing)}) — skipping")
 
-        # Phase 2: build locally if we have all the data
-        if (token_accounts is not None
-                and vsol_lamports is not None
-                and vtoken_raw is not None
-                and vtoken_raw > 0
-                and vsol_lamports > 0):
-            try:
-                blockhash = await self._fresh_blockhash()
-                tx_bytes  = self._build_local_buy_tx(
-                    mint_str      = mint_str,
-                    accounts      = token_accounts,
-                    sol_lamports  = sol_lamports,
-                    vtoken_raw    = vtoken_raw,
-                    vsol_lamports = vsol_lamports,
-                    blockhash     = blockhash,
-                )
-                tx_b64 = base64.b64encode(tx_bytes).decode()
-                sig    = await self._send_fast(tx_b64)
-                log.info("BUY  submitted (local)  sig=%s", sig)
-                return sig
-            except Exception as exc:
-                log.warning("Local tx build failed, falling back to PumpPortal: %s", exc)
-
-        # Fallback: PumpPortal unsigned tx
-        priority_fee_sol = (
-            config.COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
+        blockhash = await self._fresh_blockhash()
+        tx_bytes  = self._build_local_buy_tx(
+            mint_str      = mint_str,
+            accounts      = token_accounts,
+            sol_lamports  = sol_lamports,
+            vtoken_raw    = vtoken_raw,
+            vsol_lamports = vsol_lamports,
+            blockhash     = blockhash,
         )
-        payload = {
-            "publicKey":        str(self._pubkey),
-            "action":           "buy",
-            "mint":             mint_str,
-            "amount":           sol_amount,
-            "denominatedInSol": "true",
-            "slippage":         int(config.SLIPPAGE * 100),
-            "priorityFee":      priority_fee_sol,
-            "pool":             "pump",
-        }
-        unsigned_tx = await self._get_pump_tx(payload)
-        tx_bytes    = self._sign_tx(unsigned_tx)
-        tx_b64      = base64.b64encode(tx_bytes).decode()
-        sig = await self._send_fast(tx_b64)
-        log.info("BUY  submitted via FALLBACK (PumpPortal tx, fast)  sig=%s", sig)
+        tx_b64 = base64.b64encode(tx_bytes).decode()
+        sig    = await self._send_fast(tx_b64)
+        log.info("BUY  submitted (local)  sig=%s", sig)
         return sig
 
-    async def sell_all(self, mint_str: str) -> str:
+    async def sell_all(self, mint_str: str, token_accounts=None) -> tuple[str, str]:
         # Poll up to 10s for balance to settle after buy confirmation lag
         raw_balance, ui_balance = 0, 0.0
         for _ in range(10):
@@ -658,30 +729,17 @@ class SolanaClient:
         if raw_balance == 0:
             raise RuntimeError(f"No token balance for {mint_str}")
 
-        priority_fee_sol = (
-            config.SELL_COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
-        )
-
-        payload = {
-            "publicKey":        str(self._pubkey),
-            "action":           "sell",
-            "mint":             mint_str,
-            "amount":           "100%",
-            "denominatedInSol": "false",
-            "slippage":         int(config.SLIPPAGE * 100),
-            "priorityFee":      priority_fee_sol,
-            "pool":             "pump",
-        }
-
         log.info("SELL %s  %.4f tokens (%d raw)", mint_str, ui_balance, raw_balance)
 
-        unsigned_tx = await self._get_pump_tx(payload)
-        tx_bytes    = self._sign_tx(unsigned_tx)
-        tx_b64      = base64.b64encode(tx_bytes).decode()
+        if token_accounts is not None:
+            blockhash = await self._fresh_blockhash()
+            tx_bytes  = self._build_local_sell_tx(mint_str, token_accounts, raw_balance, blockhash)
+            tx_b64    = base64.b64encode(tx_bytes).decode()
+            sig       = await self._send_via_rpc(tx_b64)
+            log.info("SELL submitted (local)  sig=%s", sig)
+            return sig, tx_b64
 
-        sig = await self._send_fast(tx_b64)
-        log.info("SELL submitted (fast)  sig=%s", sig)
-        return sig, tx_b64
+        raise RuntimeError(f"no token_accounts for sell of {mint_str}")
 
     async def wait_for_order(self, sig: str, label: str = "", tx_b64: str = "") -> dict:
         """Poll getSignatureStatuses until confirmed or timeout.
@@ -698,7 +756,7 @@ class SolanaClient:
             # Rebroadcast every 2s if we have the tx bytes
             if tx_b64 and (time.time() - last_broadcast) >= 2.0:
                 try:
-                    await self._send_fast(tx_b64)
+                    await self._send_via_rpc(tx_b64)
                     last_broadcast = time.time()
                     log.debug("Rebroadcast %s %s", label, sig[:16])
                 except Exception:

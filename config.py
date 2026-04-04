@@ -22,7 +22,7 @@ SENDER_TIP_LAMPORTS:      int = int(os.getenv("SENDER_TIP_LAMPORTS",      "10000
 MIN_BUY_BUFFER_LAMPORTS:  int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",  "20000000")) # 0.02 SOL — covers pump.fun ~50% curve fee + tip
 
 # RPC endpoints
-HELIUS_RPC_HTTP:   str = "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_RPC_HTTP:   str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
 HELIUS_RPC_WS:     str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
 HELIUS_SENDER_URL: str = "http://ams-sender.helius-rpc.com/fast"
 

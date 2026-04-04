@@ -30,7 +30,7 @@ from solders.pubkey import Pubkey
 
 import config
 from helius_feed import HeliusAccountFeed
-from solana_client import TokenAccounts
+from solana_client import TokenAccounts, WrongProgramError
 from state import BotState
 from logger import get_logger
 
@@ -67,7 +67,7 @@ class TokenWatch:
     """Per-token state tracked from account updates."""
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
-                 "vtoken_raw", "accounts", "ata_created",
+                 "vtoken_raw", "accounts",
                  "last_dashboard_update")
 
     def __init__(self, mint: str, symbol: str, name: str, created_at: float):
@@ -80,7 +80,6 @@ class TokenWatch:
         self.had_activity   = False
         self.vtoken_raw:  int | None           = None
         self.accounts:    TokenAccounts | None = None
-        self.ata_created: bool                 = False
         self.last_dashboard_update: float      = 0.0
 
 
@@ -139,20 +138,15 @@ class PumpFunMonitor:
             if watch and accounts:
                 watch.accounts = accounts
                 log.debug("%s  accounts prefetched", mint[:8])
-                asyncio.create_task(self._create_ata_bg(mint, accounts.assoc_user))
+        except WrongProgramError:
+            # Unsupported program — stop watching immediately
+            if mint in self._watching:
+                self._state.remove_tracked(mint)
+                del self._watching[mint]
+            await self._helius.unsubscribe(mint)
+            log.debug("%s  wrong program — dropped", mint[:8])
         except Exception as exc:
             log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
-
-    async def _create_ata_bg(self, mint: str, assoc_user: str):
-        """Fire-and-forget ATA pre-creation so buy tx can skip ix_ata."""
-        try:
-            ok = await self._solana_client.create_ata(mint, assoc_user)
-            watch = self._watching.get(mint)
-            if watch and ok:
-                watch.ata_created = True
-                log.debug("%s  ATA pre-created", mint[:8])
-        except Exception as exc:
-            log.debug("_create_ata_bg failed for %s: %s", mint[:8], exc)
 
     def _process_vsol(self, watch: TokenWatch, vsol: float):
         """Core signal logic — idempotent, safe to call from multiple feeds."""
