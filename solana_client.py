@@ -684,7 +684,11 @@ class SolanaClient:
                         elif label == "BUY":
                             sol_spent = await self._get_sol_spent(sig)
                         return {"sig": sig, "status": conf, "output_amount": output_amount, "sol_spent": sol_spent}
-            except RuntimeError:
+            except RuntimeError as exc:
+                if "-32429" in str(exc):
+                    log.debug("Status poll rate limited — waiting 5s")
+                    await asyncio.sleep(5)
+                    continue
                 raise
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
