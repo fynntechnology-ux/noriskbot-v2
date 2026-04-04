@@ -391,7 +391,7 @@ class SolanaClient:
                     AccountMeta(pubkey=_SYSTEM_PROGRAM,  is_signer=False, is_writable=False),
                     AccountMeta(pubkey=_TOKEN_PROG,      is_signer=False, is_writable=False),
                 ],
-                data=b'\x01',
+                data=b'\x00',
             )
             blockhash = await self._fresh_blockhash()
             msg = MessageV0.try_compile(
@@ -505,7 +505,7 @@ class SolanaClient:
                 AccountMeta(pubkey=_SYSTEM_PROGRAM, is_signer=False, is_writable=False),
                 AccountMeta(pubkey=_TOKEN_PROG,     is_signer=False, is_writable=False),
             ],
-            data=b'\x01',
+            data=b'\x00',
         )
 
         # ── AMM calculation ────────────────────────────────────────────────────
