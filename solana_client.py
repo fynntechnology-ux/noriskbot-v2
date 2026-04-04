@@ -382,7 +382,7 @@ class SolanaClient:
             ix_cu_limit = set_compute_unit_limit(25_000)
             ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
             ix_ata = Instruction(
-                program_id=_ASSOC_TOKEN_PROG,
+                program_id=_ASSOC_TOKEN_2022,
                 accounts=[
                     AccountMeta(pubkey=self._pubkey, is_signer=True,  is_writable=True),
                     AccountMeta(pubkey=assoc_user,   is_signer=False, is_writable=True),
@@ -391,7 +391,7 @@ class SolanaClient:
                     AccountMeta(pubkey=_SYSTEM_PROGRAM,  is_signer=False, is_writable=False),
                     AccountMeta(pubkey=_TOKEN_PROG,      is_signer=False, is_writable=False),
                 ],
-                data=b'\x00',
+                data=b'\x01',
             )
             blockhash = await self._fresh_blockhash()
             msg = Message.new_with_blockhash(
@@ -495,7 +495,7 @@ class SolanaClient:
 
         # ── ATA create-if-needed ───────────────────────────────────────────────
         ix_ata = Instruction(
-            program_id=_ASSOC_TOKEN_PROG,
+            program_id=_ASSOC_TOKEN_2022,
             accounts=[
                 AccountMeta(pubkey=self._pubkey,    is_signer=True,  is_writable=True),
                 AccountMeta(pubkey=assoc_user,      is_signer=False, is_writable=True),
@@ -504,7 +504,7 @@ class SolanaClient:
                 AccountMeta(pubkey=_SYSTEM_PROGRAM, is_signer=False, is_writable=False),
                 AccountMeta(pubkey=_TOKEN_PROG,     is_signer=False, is_writable=False),
             ],
-            data=b'\x00',
+            data=b'\x01',
         )
 
         # ── AMM calculation ────────────────────────────────────────────────────
