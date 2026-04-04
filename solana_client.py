@@ -394,14 +394,13 @@ class SolanaClient:
                 data=b'\x00',
             )
             blockhash = await self._fresh_blockhash()
-            msg = MessageV0.try_compile(
-                payer=self._pubkey,
-                instructions=[ix_cu_limit, ix_cu_price, ix_ata],
-                address_lookup_table_accounts=[],
-                recent_blockhash=Hash.from_string(blockhash),
+            msg = Message.new_with_blockhash(
+                [ix_cu_limit, ix_cu_price, ix_ata],
+                self._pubkey,
+                Hash.from_string(blockhash),
             )
-            sig_obj = self._keypair.sign_message(bytes([0x80]) + bytes(msg))
-            tx_bytes = bytes(VersionedTransaction.populate(msg, [sig_obj]))
+            sig_obj  = self._keypair.sign_message(bytes(msg))
+            tx_bytes = bytes(Transaction.populate(msg, [sig_obj]))
             tx_b64   = base64.b64encode(tx_bytes).decode()
             await self._send_via_rpc(tx_b64)
             log.debug("ATA pre-created for %s", mint_str[:8])
