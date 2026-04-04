@@ -141,7 +141,7 @@ class PumpFunMonitor:
         except Exception as exc:
             log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
 
-def _process_vsol(self, watch: TokenWatch, vsol: float):
+    def _process_vsol(self, watch: TokenWatch, vsol: float):
         """Core signal logic — idempotent, safe to call from multiple feeds."""
         mint = watch.mint
 
