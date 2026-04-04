@@ -41,7 +41,7 @@ _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA
 _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 
 # Helius Sender tip recipient — must be one of the addresses Sender accepts
-_HELIUS_TIP       = Pubkey.from_string("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey")
+_HELIUS_TIP       = Pubkey.from_string("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT")
 
 # Buy instruction discriminator (8 bytes)
 _BUY_DISC = bytes([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
