@@ -647,20 +647,31 @@ class SolanaClient:
         tx_bytes    = self._sign_tx(unsigned_tx)
         tx_b64      = base64.b64encode(tx_bytes).decode()
 
-        sig = await self._send_via_rpc(tx_b64)
-        log.info("SELL submitted (rpc)  sig=%s", sig)
-        return sig
+        sig = await self._send_fast(tx_b64)
+        log.info("SELL submitted (fast)  sig=%s", sig)
+        return sig, tx_b64
 
-    async def wait_for_order(self, sig: str, label: str = "") -> dict:
+    async def wait_for_order(self, sig: str, label: str = "", tx_b64: str = "") -> dict:
         """Poll getSignatureStatuses until confirmed or timeout.
 
-        For SELL transactions, also fetches the confirmed tx to read the
-        wallet's SOL delta (postBalance - preBalance for account[0]) so
-        position_manager can record accurate P&L.
+        Rebroadcasts the tx every 2s when tx_b64 is provided so missed slots
+        don't cause a timeout. For SELL transactions, also fetches the confirmed
+        tx to read the wallet's SOL delta for P&L tracking.
         """
-        timeout_s = 30 if label == "BUY" else 60
-        deadline  = time.time() + timeout_s
+        timeout_s      = 30 if label == "BUY" else 60
+        deadline       = time.time() + timeout_s
+        last_broadcast = time.time()
+
         while time.time() < deadline:
+            # Rebroadcast every 2s if we have the tx bytes
+            if tx_b64 and (time.time() - last_broadcast) >= 2.0:
+                try:
+                    await self._send_fast(tx_b64)
+                    last_broadcast = time.time()
+                    log.debug("Rebroadcast %s %s", label, sig[:16])
+                except Exception:
+                    pass
+
             try:
                 result   = await self._rpc({
                     "method": "getSignatureStatuses",

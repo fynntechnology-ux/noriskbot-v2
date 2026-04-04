@@ -53,9 +53,9 @@ class PositionManager:
 
         for attempt in range(1, 4):
             try:
-                order_id = await self._solana.sell_all(pos.mint)
+                order_id, tx_b64 = await self._solana.sell_all(pos.mint)
                 pos.sell_order_id = order_id
-                result = await self._solana.wait_for_order(order_id, label="SELL")
+                result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64)
                 sol_back = float(result.get("output_amount", 0)) / config.LAMPORTS_PER_SOL
                 self._state.close_position(pos.mint, sol_back, success=True)
                 self._state.log("sell", pos.mint, pos.symbol,
