@@ -40,8 +40,11 @@ _ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe
 _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 
-# Helius Sender tip recipient — must be one of the addresses Sender accepts
-_HELIUS_TIP       = Pubkey.from_string("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT")
+# Astralane tip recipient
+_ASTRALANE_TIP    = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
+
+# Nonce account sysvar required by AdvanceNonceAccount instruction
+_SYSVAR_RECENT_BLOCKHASHES = Pubkey.from_string("SysvarRecentB1ockHashes11111111111111111111")
 
 # Buy / Sell instruction discriminators (sha256("global:buy/sell")[:8])
 _BUY_DISC  = bytes([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
@@ -247,9 +250,9 @@ class SolanaClient:
         return result
 
     async def _send_via_sender(self, tx_b64: str) -> str:
-        """Submit via Helius Sender — staked connection, priority inclusion."""
+        """Submit via Astralane sendTransaction (base64 encoded)."""
         async with self._session.post(
-            config.HELIUS_SENDER_URL,
+            config.ASTRALANE_URL,
             json={
                 "jsonrpc": "2.0",
                 "id":      1,
@@ -264,19 +267,52 @@ class SolanaClient:
             timeout=aiohttp.ClientTimeout(total=2),
         ) as resp:
             data = await resp.json(content_type=None)
-        log.debug("Sender response (status=%d): %s", resp.status, data)
+        log.debug("Astralane response (status=%d): %s", resp.status, data)
         if "error" in data:
-            raise RuntimeError(f"Sender error: {data['error']}")
+            raise RuntimeError(f"Astralane error: {data['error']}")
         if "result" not in data:
-            raise RuntimeError(f"Sender unexpected response: {data}")
+            raise RuntimeError(f"Astralane unexpected response: {data}")
         return data["result"]
 
-    async def _send_fast(self, tx_b64: str) -> str:
-        """Race Helius Sender and RPC in parallel — first successful response wins."""
+    async def _send_via_astralane(self, tx_bytes: bytes) -> str:
+        """Submit raw tx bytes to Astralane with Bearer auth (used for nonce txs)."""
+        encoded = base64.b64encode(tx_bytes).decode()
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {config.ASTRALANE_API_KEY}",
+        }
+        async with self._session.post(
+            config.ASTRALANE_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "sendTransaction",
+                "params":  [encoded, {"encoding": "base64", "skipPreflight": True}],
+            },
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if "error" in data:
+            raise RuntimeError(f"Astralane error: {data['error']}")
+        result = data.get("result")
+        if not result:
+            raise RuntimeError(f"Astralane unexpected response: {data}")
+        return result
+
+    async def _send_fast(self, tx_b64: str, tx_bytes: bytes | None = None) -> str:
+        """Race all available endpoints in parallel — first successful response wins.
+
+        When nonce is enabled, blasts to Astralane, Helius Sender, and Helius RPC.
+        Without nonce, races Astralane sender and Helius RPC.
+        """
         tasks = [
             asyncio.create_task(self._send_via_sender(tx_b64)),
             asyncio.create_task(self._send_via_rpc(tx_b64)),
         ]
+        if tx_bytes is not None and config.NONCE_ACCOUNT:
+            tasks.append(asyncio.create_task(self._send_via_astralane(tx_bytes)))
+
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
@@ -286,6 +322,75 @@ class SolanaClient:
                 return t.result()
         # All completed tasks failed — re-raise the first exception
         raise done.pop().exception()
+
+    async def _fetch_nonce(self) -> str:
+        """Read the durable nonce value from the nonce account.
+
+        Nonce account data layout (80 bytes after 4-byte version):
+          [0:4]   version       (u32 LE)
+          [4:8]   state         (u32 LE) — 1 = initialized
+          [8:40]  authority     (32-byte pubkey)
+          [40:72] nonce         (32-byte hash — use as blockhash in tx)
+          [72:80] fee_calculator (u64 LE lamports_per_signature)
+        """
+        result = await self._rpc({
+            "method": "getAccountInfo",
+            "params": [config.NONCE_ACCOUNT, {"encoding": "base64", "commitment": "processed"}],
+        }, timeout=3)
+        data_b64 = (result.get("value") or {}).get("data", [None])[0]
+        if not data_b64:
+            raise RuntimeError("Nonce account not found or empty")
+        data = base64.b64decode(data_b64)
+        if len(data) < 80:
+            raise RuntimeError(f"Nonce account data too short: {len(data)} bytes")
+        nonce_bytes = data[40:72]
+        return str(Hash.from_bytes(nonce_bytes))
+
+    async def create_nonce_account(self) -> str:
+        """One-time utility: create and fund a durable nonce account (0.0015 SOL).
+
+        The nonce account is a new randomly-generated keypair; the bot wallet is
+        the authority. Prints the new address and returns it. Call via:
+            python3 main.py --create-nonce
+        """
+        from solders.system_program import (
+            create_account, CreateAccountParams,
+            initialize_nonce_account, InitializeNonceAccountParams,
+        )
+
+        nonce_keypair = Keypair()
+        nonce_pubkey  = nonce_keypair.pubkey()
+        NONCE_RENT    = 1_447_680  # min-rent for 80-byte nonce account
+
+        blockhash = await self._fresh_blockhash()
+
+        ix_create = create_account(CreateAccountParams(
+            from_pubkey=self._pubkey,
+            to_pubkey=nonce_pubkey,
+            lamports=NONCE_RENT,
+            space=80,
+            owner=_SYSTEM_PROGRAM,
+        ))
+        ix_init = initialize_nonce_account(InitializeNonceAccountParams(
+            nonce_pubkey=nonce_pubkey,
+            authorized=self._pubkey,
+        ))
+
+        msg = Message.new_with_blockhash(
+            [ix_create, ix_init],
+            self._pubkey,
+            Hash.from_string(blockhash),
+        )
+        sig_wallet = self._keypair.sign_message(bytes(msg))
+        sig_nonce  = nonce_keypair.sign_message(bytes(msg))
+        tx = bytes(Transaction.populate(msg, [sig_wallet, sig_nonce]))
+        tx_b64 = base64.b64encode(tx).decode()
+
+        sig = await self._send_via_rpc(tx_b64)
+        print(f"\nNonce account created: {nonce_pubkey}")
+        print(f"Add to .env: NONCE_ACCOUNT={nonce_pubkey}")
+        print(f"Creation tx: {sig}\n")
+        return str(nonce_pubkey)
 
     # ── PumpPortal unsigned transaction builder ──────────────────────────────
 
@@ -578,16 +683,34 @@ class SolanaClient:
             data=bytes(buy_data),
         )
 
-        # ── Tip to Helius Sender — placed last (after buy) ────────────────────
+        # ── Tip to Astralane — placed last (after buy) ───────────────────────
         ix_tip = transfer(TransferParams(
             from_pubkey=self._pubkey,
-            to_pubkey=_HELIUS_TIP,
+            to_pubkey=_ASTRALANE_TIP,
             lamports=config.SENDER_TIP_LAMPORTS,
         ))
 
+        # ── AdvanceNonceAccount (prepended when durable nonce is configured) ────
+        # Nonce ix must be first; the nonce value is used as the message blockhash.
+        instructions = []
+        if config.NONCE_ACCOUNT:
+            nonce_acct = Pubkey.from_string(config.NONCE_ACCOUNT)
+            ix_advance = Instruction(
+                program_id=_SYSTEM_PROGRAM,
+                accounts=[
+                    AccountMeta(nonce_acct,   False, True),   # nonce account (writable)
+                    AccountMeta(_SYSVAR_RECENT_BLOCKHASHES, False, False),  # recent blockhashes sysvar
+                    AccountMeta(self._pubkey, True,  False),  # nonce authority (signer)
+                ],
+                data=bytes([4, 0, 0, 0]),  # SystemInstruction::AdvanceNonceAccount
+            )
+            instructions.append(ix_advance)
+
+        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip])
+
         # ── Legacy message — no ALT, immune to index drift ────────────────────
         msg = Message.new_with_blockhash(
-            [ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip],
+            instructions,
             self._pubkey,
             Hash.from_string(blockhash),
         )
@@ -697,9 +820,10 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fetch blockhash and fresh on-chain reserves in parallel
+        # Fetch blockhash (or nonce) and fresh on-chain reserves in parallel
+        bh_coro = self._fetch_nonce() if config.NONCE_ACCOUNT else self._fresh_blockhash()
         blockhash, fresh_reserves = await asyncio.gather(
-            self._fresh_blockhash(),
+            bh_coro,
             self._fetch_bc_reserves(token_accounts.bonding_curve),
         )
 
@@ -711,7 +835,7 @@ class SolanaClient:
         elif vsol_lamports is None or not vtoken_raw:
             raise RuntimeError("missing reserves and fresh fetch failed — skipping")
 
-        tx_bytes  = self._build_local_buy_tx(
+        tx_bytes = self._build_local_buy_tx(
             mint_str      = mint_str,
             accounts      = token_accounts,
             sol_lamports  = sol_lamports,
@@ -720,7 +844,7 @@ class SolanaClient:
             blockhash     = blockhash,
         )
         tx_b64 = base64.b64encode(tx_bytes).decode()
-        sig    = await self._send_fast(tx_b64)
+        sig    = await self._send_fast(tx_b64, tx_bytes)
         log.info("BUY  submitted (local)  sig=%s", sig)
         return sig
 

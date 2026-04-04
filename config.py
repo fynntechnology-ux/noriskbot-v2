@@ -24,7 +24,11 @@ MIN_BUY_BUFFER_LAMPORTS:  int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",  "20000
 # RPC endpoints
 HELIUS_RPC_HTTP:   str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
 HELIUS_RPC_WS:     str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-HELIUS_SENDER_URL: str = "http://ams-sender.helius-rpc.com/fast"
+ASTRALANE_URL:     str = os.getenv("ASTRALANE_URL", "https://fr.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
+ASTRALANE_API_KEY: str = os.getenv("ASTRALANE_API_KEY", "")
+
+# Durable nonce (optional) — set NONCE_ACCOUNT to enable pre-signed txs
+NONCE_ACCOUNT:     str = os.getenv("NONCE_ACCOUNT", "")
 
 # PumpPortal WebSocket for new token events
 PUMPPORTAL_WS: str = "wss://pumpportal.fun/api/data"

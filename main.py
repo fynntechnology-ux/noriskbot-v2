@@ -6,6 +6,9 @@ Usage:
     cp .env.example .env
     # fill in credentials
     python main.py
+
+    # One-time: create a durable nonce account and print its address
+    python main.py --create-nonce
 """
 
 import asyncio
@@ -18,6 +21,16 @@ from state import BotState
 from logger import get_logger
 
 log = get_logger("main")
+
+
+async def _create_nonce():
+    from solana_client import SolanaClient
+    client = SolanaClient()
+    await client.warmup()
+    try:
+        await client.create_nonce_account()
+    finally:
+        await client.close()
 
 
 async def main():
@@ -50,4 +63,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--create-nonce" in sys.argv:
+        asyncio.run(_create_nonce())
+    else:
+        asyncio.run(main())
