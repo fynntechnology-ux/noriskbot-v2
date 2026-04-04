@@ -56,7 +56,7 @@ _BUY_DISC = bytes([0x66, 0x32, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea])
 #   [11] 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf  GLOBAL            buy[0]  (readonly)
 #   [22] 62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV  FEE_RECIPIENT     buy[1]  (writable)
 #   [24] Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y  CONST_12          buy[12] (readonly)
-#   [26] FgX1cdFq7khWeivEfHCULBA6ovtSr9djdAfJ9r3LvNST  CONST_17          buy[17] (writable)
+#   [31] 7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4a6  FEE_CONFIG        buy[17] (writable) — added Sep 2025
 #   [28] pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ   PFEE_PROG         buy[15] (readonly)
 #   [29] 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt  CONST_14          buy[14] (readonly)
 _PUMP_ALT_ADDR  = Pubkey.from_string("84gxtAAWToZ6xep3wrWsx8TEoLB7EBS9VrKkV9CtMdJi")
@@ -523,7 +523,7 @@ class SolanaClient:
         _const12   = alt[24]  # buy[12] Hq2wp8uJ9...
         _const14   = alt[29]  # buy[14] 8Wf5TiAheL...
         _pfee_prog = alt[28]  # buy[15] pfeeUxB6... (PFEE_PROG)
-        _const17   = alt[26]  # buy[17] FgX1cdFq7... writable
+        _const17   = alt[31]  # buy[17] 7FeFBYbew... FEE_CONFIG (writable, added Sep 2025)
 
         ix_buy = Instruction(
             program_id=_PUMP_NEW_PROG,
@@ -545,7 +545,7 @@ class SolanaClient:
                 AccountMeta(_const14,     False, False),  # [14]
                 AccountMeta(_pfee_prog,   False, False),  # [15] PFEE_PROG
                 AccountMeta(unk16,        False, True),   # [16]
-                AccountMeta(_const17,     False, False),  # [17] readonly
+                AccountMeta(_const17,     False, True),   # [17] FEE_CONFIG (writable)
             ],
             data=bytes(buy_data),
         )
