@@ -619,8 +619,8 @@ class SolanaClient:
           [11] program          readonly
           [12] CONST14          readonly
           [13] pfeeProgram      readonly
-          [14] unk16            writable
-          [15] pump_const1      writable
+          [14] pump_const1      writable  (per-user account = buy[13])
+          [15] unk16            readonly  (per-token account = buy[16])
 
         Instructions: SetCULimit, SetCUPrice, sell, tip
         """
@@ -640,7 +640,7 @@ class SolanaClient:
         _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 
-        ix_cu_limit = set_compute_unit_limit(60_000)
+        ix_cu_limit = set_compute_unit_limit(100_000)
         ix_cu_price = set_compute_unit_price(config.SELL_COMPUTE_UNIT_PRICE)
 
         sell_data = (
@@ -666,8 +666,8 @@ class SolanaClient:
                 AccountMeta(_PUMP_OLD_PROG,  False, False),  # [11] program self-ref
                 AccountMeta(_CONST14,        False, False),  # [12]
                 AccountMeta(_PFEE_PROG,      False, False),  # [13] pfee program
-                AccountMeta(unk16,           False, True),   # [14] per-token (writable)
-                AccountMeta(pump_const1,     False, True),   # [15] per-token (writable)
+                AccountMeta(pump_const1,     False, True),   # [14] per-user account (writable) = buy[13]
+                AccountMeta(unk16,           False, False),  # [15] per-token (readonly)         = buy[16]
             ],
             data=bytes(sell_data),
         )
@@ -694,15 +694,23 @@ class SolanaClient:
 
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
 
-        # Require all local tx data — no fallback, PumpPortal txs can't compete
-        missing = []
-        if token_accounts is None:  missing.append("token_accounts")
-        if vsol_lamports  is None:  missing.append("vsol_lamports")
-        if not vtoken_raw:          missing.append("vtoken_raw")
-        if missing:
-            raise RuntimeError(f"missing prefetch data ({', '.join(missing)}) — skipping")
+        if token_accounts is None:
+            raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        blockhash = await self._fresh_blockhash()
+        # Fetch blockhash and fresh on-chain reserves in parallel
+        blockhash, fresh_reserves = await asyncio.gather(
+            self._fresh_blockhash(),
+            self._fetch_bc_reserves(token_accounts.bonding_curve),
+        )
+
+        # Always prefer fresh on-chain reserves — signal values may be stale
+        # or in wrong units if sourced from PumpPortal (UI units vs raw u64)
+        if fresh_reserves:
+            vsol_lamports, vtoken_raw = fresh_reserves
+            log.debug("BUY using fresh reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
+        elif vsol_lamports is None or not vtoken_raw:
+            raise RuntimeError("missing reserves and fresh fetch failed — skipping")
+
         tx_bytes  = self._build_local_buy_tx(
             mint_str      = mint_str,
             accounts      = token_accounts,
