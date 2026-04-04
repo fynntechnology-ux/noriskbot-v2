@@ -20,9 +20,9 @@ import aiohttp
 from solders.hash import Hash
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
-from solders.message import MessageV0
+from solders.message import Message, MessageV0
 from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
+from solders.transaction import Transaction, VersionedTransaction
 
 import config
 from logger import get_logger
@@ -441,61 +441,72 @@ class SolanaClient:
 
     def _build_local_buy_tx(
         self,
-        mint_str:     str,
-        accounts:     TokenAccounts,
-        sol_lamports: int,
-        vtoken_raw:   int,
+        mint_str:      str,
+        accounts:      TokenAccounts,
+        sol_lamports:  int,
+        vtoken_raw:    int,
         vsol_lamports: int,
-        blockhash:    str,
+        blockhash:     str,
     ) -> bytes:
         """
-        Build and sign a pump.fun buy transaction locally.
+        Build and sign a pump.fun buy transaction locally using Legacy format.
+
+        Legacy (not V0) — no ALT, no index drift if pump.fun updates the table.
+        All global constants are hardcoded by address.
 
         Instructions:
           1. SetComputeUnitLimit
           2. SetComputeUnitPrice
           3. SystemProgram::transfer  (tip to Helius Sender)
           4. AssociatedTokenAccount create-if-needed  (user's token ATA)
-          5. pump.fun buy
-
-        AMM pricing:
-          tokens_out = expected_tokens  — full AMM estimate, sets the buy size
-          max_sol_cost = sol_lamports * (1 + slippage)  — SOL ceiling, absorbs price drift
+          5. pump.fun buy  (18 accounts)
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
         from solders.system_program import transfer, TransferParams
 
-        mint = Pubkey.from_string(mint_str)
+        mint        = Pubkey.from_string(mint_str)
+        assoc_user  = Pubkey.from_string(accounts.assoc_user)
+        bc          = Pubkey.from_string(accounts.bonding_curve)
+        abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
+        cvlt        = Pubkey.from_string(accounts.creator_vault)
+        pump_const1 = Pubkey.from_string(accounts.pump_const1)
+        unk16       = Pubkey.from_string(accounts.unk16)
 
-        # ── 1. Compute budget ──────────────────────────────────────────────────
+        # Global constants — hardcoded by address, immune to ALT index drift
+        _GLOBAL     = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        _FEE_RECIP  = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+        _CONST10    = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+        _CONST12    = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
+        _CONST14    = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
+        _PFEE_PROG  = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+        _FEE_CONFIG = Pubkey.from_string("7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4g6")
+
+        # ── Compute budget ─────────────────────────────────────────────────────
         ix_cu_limit = set_compute_unit_limit(config.COMPUTE_UNIT_LIMIT)
         ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
 
-        # ── 2. Tip to Helius Sender ────────────────────────────────────────────
+        # ── Tip to Helius Sender ───────────────────────────────────────────────
         ix_tip = transfer(TransferParams(
             from_pubkey=self._pubkey,
             to_pubkey=_HELIUS_TIP,
             lamports=config.SENDER_TIP_LAMPORTS,
         ))
 
-        # ── 3. ATA create-if-needed ────────────────────────────────────────────
-        assoc_user = Pubkey.from_string(accounts.assoc_user)
+        # ── ATA create-if-needed ───────────────────────────────────────────────
         ix_ata = Instruction(
             program_id=_ASSOC_TOKEN_2022,
             accounts=[
-                AccountMeta(pubkey=self._pubkey, is_signer=True,  is_writable=True),
-                AccountMeta(pubkey=assoc_user,   is_signer=False, is_writable=True),
-                AccountMeta(pubkey=self._pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=mint,         is_signer=False, is_writable=False),
-                AccountMeta(pubkey=_SYSTEM_PROGRAM,  is_signer=False, is_writable=False),
-                AccountMeta(pubkey=_TOKEN_2022,      is_signer=False, is_writable=False),
+                AccountMeta(pubkey=self._pubkey,    is_signer=True,  is_writable=True),
+                AccountMeta(pubkey=assoc_user,      is_signer=False, is_writable=True),
+                AccountMeta(pubkey=self._pubkey,    is_signer=False, is_writable=False),
+                AccountMeta(pubkey=mint,            is_signer=False, is_writable=False),
+                AccountMeta(pubkey=_SYSTEM_PROGRAM, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=_TOKEN_2022,     is_signer=False, is_writable=False),
             ],
-            data=b'\x01',  # idempotent create
+            data=b'\x01',
         )
 
-        # ── 4. pump.fun buy ────────────────────────────────────────────────────
-        # tokens_out: full AMM estimate — sets the buy size; max_sol_cost is the slippage guard
-        # minimum acceptable amount — handles vSol drift between signal and execution
+        # ── AMM calculation ────────────────────────────────────────────────────
         tokens_out   = int(sol_lamports * vtoken_raw // (vsol_lamports + sol_lamports))
         max_sol_cost = int(sol_lamports * (1 + config.SLIPPAGE))
         slippage_bps = int(config.SLIPPAGE * 10000)
@@ -504,60 +515,43 @@ class SolanaClient:
             _BUY_DISC
             + struct.pack("<Q", tokens_out)
             + struct.pack("<Q", max_sol_cost)
-            + struct.pack("<H", slippage_bps)  # required by pump.fun on-chain struct
+            + struct.pack("<H", slippage_bps)
         )
 
-        bc          = Pubkey.from_string(accounts.bonding_curve)
-        abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
-        cvlt        = Pubkey.from_string(accounts.creator_vault)
-        pump_const1 = Pubkey.from_string(accounts.pump_const1)
-        unk16       = Pubkey.from_string(accounts.unk16)
-
-        # ALT-sourced constants — indices verified by decoding a live PumpPortal buy tx
-        alt = self._pump_alt.addresses
-        _global    = alt[11]  # buy[0]  GLOBAL (4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf)
-        _fee_recip = alt[22]  # buy[1]  FEE_RECIPIENT (62qc2CNX...fafNgV) writable
-        _sys_prog  = alt[1]   # buy[7]  SYSTEM_PROGRAM (11111...)
-        _const10   = alt[5]   # buy[10] Ce6TQqeHC9p8...
-        _pump_old  = alt[2]   # buy[11] PUMP_OLD_PROG (6EF8...)
-        _const12   = alt[24]  # buy[12] Hq2wp8uJ9...
-        _const14   = alt[29]  # buy[14] 8Wf5TiAheL...
-        _pfee_prog = alt[28]  # buy[15] pfeeUxB6... (PFEE_PROG)
-        _const17   = alt[31]  # buy[17] 7FeFBYbew... FEE_CONFIG (writable, added Sep 2025)
-
+        # ── Buy instruction — all 18 accounts by full address, no ALT ─────────
         ix_buy = Instruction(
             program_id=_PUMP_NEW_PROG,
             accounts=[
-                AccountMeta(_global,      False, False),  # [0]  GLOBAL
-                AccountMeta(_fee_recip,   False, True),   # [1]  FEE_RECIPIENT (writable)
-                AccountMeta(mint,         False, False),  # [2]
-                AccountMeta(bc,           False, True),   # [3]
-                AccountMeta(abc,          False, True),   # [4]
-                AccountMeta(assoc_user,   False, True),   # [5]
-                AccountMeta(self._pubkey, True,  True),   # [6]
-                AccountMeta(_sys_prog,    False, False),  # [7]  SYSTEM_PROGRAM
-                AccountMeta(_TOKEN_2022,  False, False),  # [8]
-                AccountMeta(cvlt,         False, True),   # [9]
-                AccountMeta(_const10,     False, False),  # [10]
-                AccountMeta(_pump_old,    False, False),  # [11] PUMP_OLD_PROG
-                AccountMeta(_const12,     False, False),  # [12]
-                AccountMeta(pump_const1,  False, True),   # [13] per-token (prefetch static[5])
-                AccountMeta(_const14,     False, False),  # [14]
-                AccountMeta(_pfee_prog,   False, False),  # [15] PFEE_PROG
-                AccountMeta(unk16,        False, True),   # [16]
-                AccountMeta(_const17,     False, True),   # [17] FEE_CONFIG (writable)
+                AccountMeta(_GLOBAL,        False, False),  # [0]  global
+                AccountMeta(_FEE_RECIP,     False, True),   # [1]  fee recipient (writable)
+                AccountMeta(mint,           False, False),  # [2]  mint
+                AccountMeta(bc,             False, True),   # [3]  bonding curve (writable)
+                AccountMeta(abc,            False, True),   # [4]  assoc bonding curve (writable)
+                AccountMeta(assoc_user,     False, True),   # [5]  user ATA (writable)
+                AccountMeta(self._pubkey,   True,  True),   # [6]  user (signer, writable)
+                AccountMeta(_SYSTEM_PROGRAM, False, False), # [7]  system program
+                AccountMeta(_TOKEN_2022,    False, False),  # [8]  token-2022 program
+                AccountMeta(cvlt,           False, True),   # [9]  creator vault (writable)
+                AccountMeta(_CONST10,       False, False),  # [10]
+                AccountMeta(_PUMP_OLD_PROG, False, False),  # [11] pump old program
+                AccountMeta(_CONST12,       False, False),  # [12]
+                AccountMeta(pump_const1,    False, True),   # [13] per-token (writable)
+                AccountMeta(_CONST14,       False, False),  # [14]
+                AccountMeta(_PFEE_PROG,     False, False),  # [15] pfee program
+                AccountMeta(unk16,          False, True),   # [16] per-token (writable)
+                AccountMeta(_FEE_CONFIG,    False, True),   # [17] fee config (writable, Sep 2025)
             ],
             data=bytes(buy_data),
         )
 
-        msg = MessageV0.try_compile(
-            payer=self._pubkey,
-            instructions=[ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
-            address_lookup_table_accounts=[self._pump_alt],
-            recent_blockhash=Hash.from_string(blockhash),
+        # ── Legacy message — no ALT, immune to index drift ────────────────────
+        msg = Message.new_with_blockhash(
+            [ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
+            self._pubkey,
+            Hash.from_string(blockhash),
         )
-        sig = self._keypair.sign_message(bytes([0x80]) + bytes(msg))
-        return bytes(VersionedTransaction.populate(msg, [sig]))
+        sig = self._keypair.sign_message(bytes(msg))
+        return bytes(Transaction.populate(msg, [sig]))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -578,8 +572,7 @@ class SolanaClient:
                         mint_str[:8])
 
         # Phase 2: build locally if we have all the data
-        if (self._pump_alt is not None
-                and token_accounts is not None
+        if (token_accounts is not None
                 and vsol_lamports is not None
                 and vtoken_raw is not None
                 and vtoken_raw > 0
