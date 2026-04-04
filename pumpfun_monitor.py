@@ -213,7 +213,6 @@ class PumpFunMonitor:
             "vsol_lamports":    int(watch.vsol * 1e9),
             "vtoken_raw":       watch.vtoken_raw,
             "token_accounts":   watch.accounts,
-            "ata_created":      watch.ata_created,
         })
 
     # ------------------------------------------------------------------
