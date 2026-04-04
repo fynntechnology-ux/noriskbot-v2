@@ -73,6 +73,7 @@ class PumpSnipeBot:
                 token_accounts = signal.get("token_accounts"),
                 vsol_lamports  = signal.get("vsol_lamports"),
                 vtoken_raw     = signal.get("vtoken_raw"),
+                ata_created    = signal.get("ata_created", False),
             )
             await self._positions.open(
                 mint=mint,

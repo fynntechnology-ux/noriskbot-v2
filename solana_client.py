@@ -448,6 +448,7 @@ class SolanaClient:
         vtoken_raw:    int,
         vsol_lamports: int,
         blockhash:     str,
+        ata_created:   bool = False,
     ) -> bytes:
         """
         Build and sign a pump.fun buy transaction locally using Legacy format.
@@ -544,8 +545,12 @@ class SolanaClient:
         )
 
         # ── Legacy message — no ALT, immune to index drift ────────────────────
+        ixs = [ix_cu_limit, ix_cu_price, ix_tip]
+        if not ata_created:
+            ixs.append(ix_ata)
+        ixs.append(ix_buy)
         msg = Message.new_with_blockhash(
-            [ix_cu_limit, ix_cu_price, ix_tip, ix_ata, ix_buy],
+            ixs,
             self._pubkey,
             Hash.from_string(blockhash),
         )
@@ -561,6 +566,7 @@ class SolanaClient:
         token_accounts: "TokenAccounts | None" = None,
         vsol_lamports:  int | None             = None,
         vtoken_raw:     int | None             = None,
+        ata_created:    bool                   = False,
     ) -> str:
         log.info("BUY  %s  %.4f SOL", mint_str, sol_amount)
 
@@ -585,6 +591,7 @@ class SolanaClient:
                     vtoken_raw    = vtoken_raw,
                     vsol_lamports = vsol_lamports,
                     blockhash     = blockhash,
+                    ata_created   = ata_created,
                 )
                 tx_b64 = base64.b64encode(tx_bytes).decode()
                 sig    = await self._send_fast(tx_b64)
