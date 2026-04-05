@@ -1,5 +1,14 @@
 """
-Tracks open positions and fires auto-sell after HOLD_TIME_SECONDS.
+Tracks open positions and fires auto-sell on take profit or HOLD_TIME_SECONDS timeout.
+
+Exit logic:
+  - Take profit: sell when estimated current value >= sol_spent * (1 + TAKE_PROFIT_PCT/100)
+  - Hold timer:  sell after HOLD_TIME_SECONDS regardless of price
+  - Whichever fires first wins; the other is cancelled.
+
+Current value estimate:
+  value_sol = (tokens_held * vsol) / vtoken_raw
+  This is the AMM output if we sold right now at current reserves.
 """
 
 import asyncio
@@ -14,9 +23,10 @@ log = get_logger("positions")
 
 
 class PositionManager:
-    def __init__(self, solana_client, state: BotState):
-        self._solana = solana_client
-        self._state = state
+    def __init__(self, solana_client, state: BotState, monitor=None):
+        self._solana  = solana_client
+        self._state   = state
+        self._monitor = monitor  # PumpFunMonitor — for live price feed
 
     @property
     def open_count(self) -> int:
@@ -27,7 +37,7 @@ class PositionManager:
 
     async def open(self, mint: str, symbol: str, name: str,
                    buy_order_id: str, bonding_at_buy: float, peak_bonding: float,
-                   token_accounts=None):
+                   token_accounts=None, tokens_held: int = 0):
         pos = PositionState(
             mint=mint,
             symbol=symbol,
@@ -42,16 +52,69 @@ class PositionManager:
         self._state.open_position(pos)
         self._state.log("buy", mint, symbol,
                         f"bought {config.BUY_AMOUNT_SOL} SOL  order={buy_order_id[:12]}…")
-        log.info("Position opened  %s  hold=%ds", mint, config.HOLD_TIME_SECONDS)
-        asyncio.create_task(self._auto_sell(pos))
+        log.info("Position opened  %s  hold=%ds  tp=+%.0f%%",
+                 mint, config.HOLD_TIME_SECONDS, config.TAKE_PROFIT_PCT)
 
-    async def _auto_sell(self, pos: PositionState):
-        await asyncio.sleep(config.HOLD_TIME_SECONDS)
+        # Event fired by price monitor to trigger early exit
+        tp_event = asyncio.Event()
+
+        # Register live price callback with monitor
+        if self._monitor:
+            # We need the actual token balance from chain before we can evaluate P&L
+            # Fetch it once now, then track from live updates
+            tokens_held_holder = [tokens_held]
+
+            def _on_price_update(vsol: float, vtoken_raw: int):
+                if pos.closed or not vtoken_raw:
+                    return
+                held = tokens_held_holder[0]
+                if not held:
+                    return
+                current_value = (held * vsol) / vtoken_raw
+                gain_pct = (current_value / config.BUY_AMOUNT_SOL - 1.0) * 100.0
+                if gain_pct >= config.TAKE_PROFIT_PCT:
+                    log.info("TAKE PROFIT  %s  gain=+%.1f%%  value=%.4f SOL",
+                             mint, gain_pct, current_value)
+                    tp_event.set()
+
+            self._monitor.register_position(mint, _on_price_update)
+        else:
+            tokens_held_holder = [tokens_held]
+
+        asyncio.create_task(self._auto_sell(pos, tp_event, tokens_held_holder))
+
+    async def _auto_sell(self, pos: PositionState, tp_event: asyncio.Event,
+                         tokens_held_holder: list):
+        # Fetch actual token balance from chain (needed for accurate P&L math)
+        if not tokens_held_holder[0]:
+            for _ in range(10):
+                bal = await self._solana._fetch_ata_balance(pos.mint)
+                if bal:
+                    tokens_held_holder[0] = bal
+                    break
+                await asyncio.sleep(1)
+
+        # Race: take profit vs hold timer
+        hold_task = asyncio.create_task(asyncio.sleep(config.HOLD_TIME_SECONDS))
+        tp_task   = asyncio.create_task(tp_event.wait())
+
+        done, pending = await asyncio.wait(
+            [hold_task, tp_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
 
         if pos.closed:
+            if self._monitor:
+                self._monitor.unregister_position(pos.mint)
             return
 
-        log.info("Hold time elapsed. Selling %s…", pos.mint)
+        reason = "take_profit" if tp_task in done else "hold_timer"
+        log.info("Selling %s  reason=%s", pos.mint, reason)
+
+        if self._monitor:
+            self._monitor.unregister_position(pos.mint)
 
         for attempt in range(1, 4):
             try:
@@ -61,9 +124,9 @@ class PositionManager:
                 sol_back = float(result.get("output_amount", 0)) / config.LAMPORTS_PER_SOL
                 self._state.close_position(pos.mint, sol_back, success=True)
                 self._state.log("sell", pos.mint, pos.symbol,
-                                f"sold  returned≈{sol_back:.4f} SOL  order={order_id[:12]}…")
+                                f"sold [{reason}]  returned≈{sol_back:.4f} SOL  order={order_id[:12]}…")
                 held = time.time() - pos.bought_at
-                log.info("SELL complete  %s  held=%.1fs", pos.mint, held)
+                log.info("SELL complete  %s  held=%.1fs  reason=%s", pos.mint, held, reason)
                 await self._solana.refresh_balance()
                 return
             except Exception as exc:

@@ -86,13 +86,14 @@ class BotState:
         key = (symbol.strip().lower(), name.strip().lower())
         self.name_registry.setdefault(key, {})[mint] = time.time()
 
-    def is_duplicate(self, mint: str, symbol: str, name: str) -> bool:
-        """Return True if another mint with the same symbol+name was seen within 60s."""
+    def count_same_name(self, mint: str, symbol: str, name: str) -> int:
+        """Return how many OTHER open positions share the same symbol+name."""
         key = (symbol.strip().lower(), name.strip().lower())
-        cutoff = time.time() - 60
-        recent = {m for m, ts in self.name_registry.get(key, {}).items()
-                  if ts >= cutoff and m != mint}
-        return len(recent) > 0
+        return sum(
+            1 for p in self.open_positions
+            if p.mint != mint
+            and (p.symbol.strip().lower(), p.name.strip().lower()) == key
+        )
 
     def update_token_bonding(self, mint: str, bonding: float):
         t = self.tracked.get(mint)

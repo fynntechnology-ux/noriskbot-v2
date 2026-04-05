@@ -18,12 +18,12 @@ class PumpSnipeBot:
     def __init__(self, state: BotState):
         self._state = state
         self._solana  = SolanaClient()
-        self._positions = PositionManager(self._solana, state)
         self._monitor = PumpFunMonitor(
             on_signal=self._on_signal,
             solana_client=self._solana,
             state=state,
         )
+        self._positions = PositionManager(self._solana, state, monitor=self._monitor)
         self._buy_lock = asyncio.Lock()
         self._claimed: set[str] = set()   # mints reserved but not yet in positions
 
@@ -33,14 +33,6 @@ class PumpSnipeBot:
         name   = signal.get("name", "")
 
         if self._positions.has_position(mint):
-            return
-
-        # Skip if another coin with the same symbol+name launched in this window
-        if self._state.is_duplicate(mint, symbol, name):
-            self._state.log("skip", mint, symbol,
-                            f"duplicate name/symbol detected — skipping")
-            log.warning("Duplicate symbol+name for %s (%s / %s) — skipping buy.",
-                        mint, symbol, name)
             return
 
         # Reserve slot under lock — release before the actual buy RPC call
@@ -112,6 +104,7 @@ class PumpSnipeBot:
         log.info("  wallet        : %s", config.WALLET_ADDRESS)
         log.info("  buy amount    : %.3f SOL", config.BUY_AMOUNT_SOL)
         log.info("  hold time     : %ds", config.HOLD_TIME_SECONDS)
+        log.info("  take profit   : +%.0f%%", config.TAKE_PROFIT_PCT)
         log.info("  max token age : %ds", config.MAX_TOKEN_AGE_SECONDS)
         log.info("  trigger       : 0.0%% bonding curve (everyone sold out)")
         log.info("  slippage      : %.0f%%", config.SLIPPAGE * 100)

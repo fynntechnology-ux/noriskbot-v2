@@ -94,6 +94,8 @@ class SolanaClient:
         self._session       = aiohttp.ClientSession(connector=connector)
         self._blockhash              = ""
         self._blockhash_ts           = 0.0
+        self._nonce                  = ""   # cached nonce value
+        self._nonce_lock             = None # asyncio.Lock, created in warmup
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
         log.info("Wallet: %s", self._pubkey)
@@ -103,7 +105,9 @@ class SolanaClient:
             await self._session.close()
 
     async def warmup(self):
-        """Pre-warm TCP connections and prime the blockhash cache."""
+        """Pre-warm TCP connections and prime the blockhash/nonce cache."""
+        self._nonce_lock = asyncio.Lock()
+
         async def _warm_helius():
             try:
                 await self._rpc({"method": "getHealth"})
@@ -131,8 +135,17 @@ class SolanaClient:
             except Exception as exc:
                 log.warning("Blockhash prime failed: %s", exc)
 
+        async def _prime_nonce():
+            if not config.NONCE_ACCOUNT:
+                return
+            try:
+                self._nonce = await self._fetch_nonce_from_chain()
+                log.info("Nonce primed: %s…", self._nonce[:12])
+            except Exception as exc:
+                log.warning("Nonce prime failed: %s", exc)
+
         await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash(),
-                             self._fetch_pump_alt(), self.refresh_balance())
+                             _prime_nonce(), self._fetch_pump_alt(), self.refresh_balance())
         asyncio.create_task(self._blockhash_refresher())
 
     async def _fetch_pump_alt(self):
@@ -192,6 +205,14 @@ class SolanaClient:
         return bh
 
     # ── RPC ──────────────────────────────────────────────────────────────────
+
+    async def _refresh_nonce(self):
+        """Background task: fetch fresh nonce after it's been consumed by a buy."""
+        try:
+            self._nonce = await self._fetch_nonce_from_chain()
+            log.debug("Nonce refreshed: %s…", self._nonce[:12])
+        except Exception as exc:
+            log.warning("Nonce refresh failed: %s", exc)
 
     async def _rpc(self, body: dict, timeout: float = 5.0) -> dict:
         body.setdefault("jsonrpc", "2.0")
@@ -352,16 +373,8 @@ class SolanaClient:
         # All completed tasks failed — re-raise the first exception
         raise done.pop().exception()
 
-    async def _fetch_nonce(self) -> str:
-        """Read the durable nonce value from the nonce account.
-
-        Nonce account data layout (80 bytes after 4-byte version):
-          [0:4]   version       (u32 LE)
-          [4:8]   state         (u32 LE) — 1 = initialized
-          [8:40]  authority     (32-byte pubkey)
-          [40:72] nonce         (32-byte hash — use as blockhash in tx)
-          [72:80] fee_calculator (u64 LE lamports_per_signature)
-        """
+    async def _fetch_nonce_from_chain(self) -> str:
+        """Read the durable nonce value directly from the nonce account on-chain."""
         result = await self._rpc({
             "method": "getAccountInfo",
             "params": [config.NONCE_ACCOUNT, {"encoding": "base64", "commitment": "processed"}],
@@ -372,8 +385,20 @@ class SolanaClient:
         data = base64.b64decode(data_b64)
         if len(data) < 80:
             raise RuntimeError(f"Nonce account data too short: {len(data)} bytes")
-        nonce_bytes = data[40:72]
-        return str(Hash.from_bytes(nonce_bytes))
+        return str(Hash.from_bytes(data[40:72]))
+
+    async def _fetch_nonce(self) -> str:
+        """Return the cached nonce value. Falls back to on-chain fetch if cache is empty."""
+        if self._nonce:
+            return self._nonce
+        log.warning("Nonce cache empty — fetching from chain")
+        self._nonce = await self._fetch_nonce_from_chain()
+        return self._nonce
+
+    def invalidate_nonce(self):
+        """Call after a buy tx is submitted — nonce is consumed, must be refreshed."""
+        self._nonce = ""
+        asyncio.create_task(self._refresh_nonce())
 
     async def create_nonce_account(self) -> str:
         """One-time utility: create and fund a durable nonce account (0.0015 SOL).
@@ -513,12 +538,17 @@ class SolanaClient:
                     bc_bytes = _b64.b64decode(bc_data_b64)
                     if len(bc_bytes) >= 81:
                         creator = Pubkey.from_bytes(bc_bytes[49:81])
-                        vault, _ = Pubkey.find_program_address(
-                            [b"creator-vault", bytes(creator)], _PUMP_OLD_PROG
-                        )
-                        creator_vault_str = str(vault)
-                        log.debug("prefetch: derived creator_vault=%s for %s",
-                                  creator_vault_str[:8], mint_str[:8])
+                        # Skip if creator is system program (uninitialized/stale BC data)
+                        if str(creator) == "11111111111111111111111111111111":
+                            log.warning("prefetch: creator=system_program at offset 49 for %s — using static[4] fallback",
+                                        mint_str[:8])
+                        else:
+                            vault, _ = Pubkey.find_program_address(
+                                [b"creator-vault", bytes(creator)], _PUMP_OLD_PROG
+                            )
+                            creator_vault_str = str(vault)
+                            log.debug("prefetch: derived creator_vault=%s for %s (creator=%s)",
+                                      creator_vault_str[:8], mint_str[:8], str(creator)[:8])
             except WrongProgramError:
                 raise
             except Exception as exc:
@@ -573,6 +603,30 @@ class SolanaClient:
         except Exception as exc:
             log.debug("ATA pre-create failed for %s: %s", mint_str[:8], exc)
             return False
+
+    async def _fetch_cashback_flag(self, bc_addr: str) -> bool:
+        """Return needs_bc_v2 based on byte[82] of bonding curve data.
+
+        byte[82]==0 → old layout → [14] bc_v2 only             (15 accounts)
+        byte[82]==1 → new layout → [14] pump_const1 + [15] bc_v2 (16 accounts)
+        On RPC failure default to new layout (currently ~32% of tokens but growing).
+        Update the default once logs show a clear majority.
+        """
+        try:
+            result = await self._rpc({
+                "method": "getAccountInfo",
+                "params": [bc_addr, {"encoding": "base64", "commitment": "processed"}],
+            }, timeout=3)
+            data_b64 = (result.get("value") or {}).get("data", [None])[0]
+            if not data_b64:
+                return False  # default new layout
+            data = base64.b64decode(data_b64)
+            if len(data) <= 82:
+                return False
+            return data[82] == 0  # True = old layout (needs bc_v2 only)
+        except Exception as exc:
+            log.debug("_fetch_cashback_flag failed for %s: %s — defaulting to new layout", bc_addr[:8], exc)
+            return False  # default new layout on failure
 
     async def _fetch_bc_reserves(self, bc_addr: str) -> tuple[int, int] | None:
         """Fetch vsol_lamports and vtoken_raw directly from the bonding curve account."""
@@ -755,33 +809,20 @@ class SolanaClient:
 
     def _build_local_sell_tx(
         self,
-        mint_str:   str,
-        accounts:   TokenAccounts,
-        raw_amount: int,
-        blockhash:  str,
+        mint_str:    str,
+        accounts:    TokenAccounts,
+        raw_amount:  int,
+        blockhash:   str,
+        needs_bc_v2: bool = True,
     ) -> bytes:
         """
         Build and sign a pump.fun sell transaction locally using Legacy format.
 
-        6EF8 sell CPI account order (16 accounts, verified from on-chain inner ix):
-          [0]  global           readonly
-          [1]  feeRecipient     writable
-          [2]  mint             readonly
-          [3]  bondingCurve     writable
-          [4]  assocBondingCurve writable
-          [5]  userToken        writable  ← seed-derived account (source)
-          [6]  user             writable  signer
-          [7]  systemProgram    readonly
-          [8]  creatorVault     writable  (swapped vs buy — [9] in buy)
-          [9]  tokenProgram     readonly  (swapped vs buy — [8] in buy)
-          [10] eventAuthority   readonly
-          [11] program          readonly
-          [12] CONST14          readonly
-          [13] pfeeProgram      readonly
-          [14] pump_const1      writable  (per-user account = buy[13])
-          [15] unk16            readonly  (per-token account = buy[16])
+        Feb 2026 cashback upgrade: sell now requires remaining accounts appended:
+          - if cashback: [user_volume_accumulator]  (writable)
+          - always:      [bonding_curve_v2]          (writable)
 
-        Instructions: SetCULimit, SetCUPrice, sell, tip
+        Without these, the program reads wrong account indices → Custom:6024 Overflow.
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 
@@ -790,14 +831,30 @@ class SolanaClient:
         bc          = Pubkey.from_string(accounts.bonding_curve)
         abc         = Pubkey.from_string(accounts.assoc_bonding_curve)
         cvlt        = Pubkey.from_string(accounts.creator_vault)
-        pump_const1 = Pubkey.from_string(accounts.pump_const1)
-        unk16       = Pubkey.from_string(accounts.unk16)
 
-        _GLOBAL    = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        _GLOBAL     = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
         _FEE_RECIP = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
         _CONST10   = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
         _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+
+        # ── Remaining accounts ────────────────────────────────────────────────
+        # Verified from on-chain txs:
+        # byte[82]==0 (old): [14] bc_v2                              — 15 accounts
+        # byte[82]==1 (new): [14] 63EDqM8T (global const) + [15] bc_v2 — 16 accounts
+        _PUMP_CONST1_GLOBAL = Pubkey.from_string("63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5")
+        bc_v2, _ = Pubkey.find_program_address(
+            [b"bonding-curve-v2", bytes(mint)], _PUMP_OLD_PROG
+        )
+        if needs_bc_v2:
+            # Old layout: bc_v2 only
+            remaining = [AccountMeta(bc_v2, False, True)]
+        else:
+            # New layout: global const + bc_v2
+            remaining = [
+                AccountMeta(_PUMP_CONST1_GLOBAL, False, True),
+                AccountMeta(bc_v2,               False, True),
+            ]
 
         ix_cu_limit = set_compute_unit_limit(100_000)
         ix_cu_price = set_compute_unit_price(config.SELL_COMPUTE_UNIT_PRICE)
@@ -816,7 +873,7 @@ class SolanaClient:
                 AccountMeta(mint,            False, False),  # [2]  mint
                 AccountMeta(bc,              False, True),   # [3]  bonding curve (writable)
                 AccountMeta(abc,             False, True),   # [4]  assoc bonding curve (writable)
-                AccountMeta(user_token,      False, True),   # [5]  user token account (writable, source)
+                AccountMeta(user_token,      False, True),   # [5]  user token account (writable)
                 AccountMeta(self._pubkey,    True,  True),   # [6]  user (signer, writable)
                 AccountMeta(_SYSTEM_PROGRAM, False, False),  # [7]  system program
                 AccountMeta(cvlt,            False, True),   # [8]  creator vault (writable)
@@ -825,8 +882,7 @@ class SolanaClient:
                 AccountMeta(_PUMP_OLD_PROG,  False, False),  # [11] program self-ref
                 AccountMeta(_CONST14,        False, False),  # [12]
                 AccountMeta(_PFEE_PROG,      False, False),  # [13] pfee program
-                AccountMeta(pump_const1,     False, True),   # [14] per-user account (writable) = buy[13]
-                AccountMeta(unk16,           False, False),  # [15] per-token (readonly)         = buy[16]
+                *remaining,                                  # [14] bc_v2 if old layout; [14]+[15] if cashback
             ],
             data=bytes(sell_data),
         )
@@ -882,13 +938,33 @@ class SolanaClient:
         tx_b64 = base64.b64encode(tx_bytes).decode()
         sig    = await self._send_fast(tx_b64, tx_bytes)
         log.info("BUY  submitted (local)  sig=%s", sig)
+        # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
+        if config.NONCE_ACCOUNT:
+            self.invalidate_nonce()
         return sig
 
+    async def _fetch_ata_balance(self, mint_str: str) -> int:
+        """Fetch raw token balance directly from the seed-derived ATA we created.
+
+        Uses getTokenAccountBalance on the exact account address rather than
+        searching by owner — avoids stale/wrong amounts from account search.
+        Returns 0 if account not found or not yet settled.
+        """
+        ata = Pubkey.create_with_seed(self._pubkey, mint_str[:8], _TOKEN_2022)
+        try:
+            result = await self._rpc({
+                "method": "getTokenAccountBalance",
+                "params": [str(ata), {"commitment": "processed"}],
+            }, timeout=3)
+            return int(result["value"]["amount"])
+        except Exception:
+            return 0
+
     async def sell_all(self, mint_str: str, token_accounts=None) -> tuple[str, str]:
-        # Poll up to 10s for balance to settle after buy confirmation lag
-        raw_balance, ui_balance = 0, 0.0
+        # Poll up to 10s for balance to settle — fetch directly from seed-derived ATA
+        raw_balance = 0
         for _ in range(10):
-            raw_balance, ui_balance = await self._get_token_balance(mint_str)
+            raw_balance = await self._fetch_ata_balance(mint_str)
             if raw_balance > 0:
                 break
             log.debug("Waiting for token balance to settle for %s…", mint_str[:8])
@@ -897,13 +973,22 @@ class SolanaClient:
         if raw_balance == 0:
             raise RuntimeError(f"No token balance for {mint_str}")
 
-        log.info("SELL %s  %.4f tokens (%d raw)", mint_str, ui_balance, raw_balance)
+        log.info("SELL %s  %d raw tokens", mint_str, raw_balance)
 
         if token_accounts is not None:
-            blockhash = await self._fresh_blockhash()
-            tx_bytes  = self._build_local_sell_tx(mint_str, token_accounts, raw_balance, blockhash)
-            tx_b64    = base64.b64encode(tx_bytes).decode()
-            sig       = await self._send_via_rpc(tx_b64)
+            # Fetch cashback flag and blockhash in parallel
+            blockhash, needs_bc_v2 = await asyncio.gather(
+                self._fresh_blockhash(),
+                self._fetch_cashback_flag(token_accounts.bonding_curve),
+            )
+            log.debug("SELL %s  layout=%s accounts=%d",
+                      mint_str[:8], "old" if needs_bc_v2 else "new",
+                      15 if needs_bc_v2 else 16)
+            tx_bytes = self._build_local_sell_tx(
+                mint_str, token_accounts, raw_balance, blockhash, needs_bc_v2
+            )
+            tx_b64 = base64.b64encode(tx_bytes).decode()
+            sig    = await self._send_via_rpc(tx_b64)
             log.info("SELL submitted (local)  sig=%s", sig)
             return sig, tx_b64
 
@@ -1003,8 +1088,22 @@ class SolanaClient:
             pre  = meta.get("preBalances",  [])
             post = meta.get("postBalances", [])
             if pre and post:
-                delta = post[0] - pre[0]   # account[0] is always the fee-payer (our wallet)
-                return max(delta, 0)       # negative delta (e.g. failed tx) → report 0
+                delta = post[0] - pre[0]
+                # Passive drift detector — check if pump_const1 global has rotated
+                _EXPECTED_CONST1 = "63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5"
+                try:
+                    keys = tx["transaction"]["message"]["accountKeys"]
+                    sell_ix = next(
+                        ix for ix in tx["transaction"]["message"]["instructions"]
+                        if keys[ix["programIdIndex"]].startswith("6EF8")
+                    )
+                    accs = [keys[a] for a in sell_ix["accounts"]]
+                    if len(accs) >= 16 and accs[14] != _EXPECTED_CONST1:
+                        log.warning("pump_const1 DRIFT detected! expected=%s got=%s sig=%s",
+                                    _EXPECTED_CONST1[:16], accs[14][:16], sig[:16])
+                except Exception:
+                    pass
+                return max(delta, 0)
         except Exception as exc:
             log.debug("_get_sol_received failed for %s: %s", sig[:16], exc)
         return 0

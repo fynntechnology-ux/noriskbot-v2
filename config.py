@@ -13,6 +13,7 @@ HOLD_TIME_SECONDS:       int   = int(os.getenv("HOLD_TIME_SECONDS", "60"))
 MAX_TOKEN_AGE_SECONDS:   int   = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "60"))
 SLIPPAGE:                float = float(os.getenv("SLIPPAGE", "0.5"))
 MAX_CONCURRENT_POSITIONS:int   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+TAKE_PROFIT_PCT:         float = float(os.getenv("TAKE_PROFIT_PCT", "30.0"))  # sell when up X%
 
 # Solana transaction fees
 COMPUTE_UNIT_LIMIT:          int = int(os.getenv("COMPUTE_UNIT_LIMIT",          "200000"))

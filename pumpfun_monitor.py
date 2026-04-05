@@ -43,7 +43,7 @@ VSOL_INIT = 30.0
 VSOL_MAX  = 793.0
 
 # Thresholds
-PEAK_SOL = 3.0    # vSol must rise at least 3 SOL above init before we care
+PEAK_SOL = 1.0    # vSol must rise at least 1 SOL above init before we care
 ZERO_SOL = 0.01   # trigger when vSol is within 0.01 SOL of init
 
 # pump.fun program — used to derive bonding curve PDA
@@ -89,9 +89,20 @@ class PumpFunMonitor:
         self._state          = state
         self._solana_client  = solana_client
         self._watching: dict[str, TokenWatch] = {}
+        # Mints with open positions — still subscribed for price tracking
+        self._position_callbacks: dict[str, Callable[[float, int], None]] = {}
         self._ws             = None
         self._pending_unsubs: set[str]        = set()
         self._helius         = HeliusAccountFeed(on_update=self._on_helius_update)
+
+    def register_position(self, mint: str, callback: Callable[[float, int], None]):
+        """Called by PositionManager after a buy — keeps Helius feed alive for price tracking."""
+        self._position_callbacks[mint] = callback
+
+    def unregister_position(self, mint: str):
+        """Called by PositionManager when position closes — unsubscribe Helius."""
+        self._position_callbacks.pop(mint, None)
+        asyncio.create_task(self._helius.unsubscribe(mint))
 
     # ------------------------------------------------------------------
     # VSol processing — called by both PumpPortal trades and Helius feed
@@ -99,6 +110,10 @@ class PumpFunMonitor:
 
     def _on_helius_update(self, mint: str, vsol: float, vtoken_raw: int):
         """Called by HeliusAccountFeed with parsed reserves."""
+        # Feed open position price tracker if one exists
+        cb = self._position_callbacks.get(mint)
+        if cb:
+            cb(vsol, vtoken_raw)
         watch = self._watching.get(mint)
         if watch:
             watch.vtoken_raw = vtoken_raw
