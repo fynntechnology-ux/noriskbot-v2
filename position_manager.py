@@ -94,6 +94,35 @@ class PositionManager:
                     break
                 await asyncio.sleep(1)
 
+        # Periodic price poll — Helius push only fires when someone trades,
+        # but these tokens often go dead after our buy so we need to poll
+        async def _poll_tp():
+            while not pos.closed and not tp_event.is_set():
+                await asyncio.sleep(5)
+                held = tokens_held_holder[0]
+                if not held or not pos.token_accounts:
+                    continue
+                try:
+                    reserves = await self._solana._fetch_bc_reserves(
+                        pos.token_accounts.bonding_curve
+                    )
+                    if reserves is None:
+                        continue
+                    vsol_lamports, vtoken_raw = reserves
+                    if not vtoken_raw:
+                        continue
+                    vsol = vsol_lamports / config.LAMPORTS_PER_SOL
+                    current_value = (held * vsol) / vtoken_raw
+                    gain_pct = (current_value / config.BUY_AMOUNT_SOL - 1.0) * 100.0
+                    if gain_pct >= config.TAKE_PROFIT_PCT:
+                        log.info("TAKE PROFIT (poll)  %s  gain=+%.1f%%  value=%.4f SOL",
+                                 pos.mint, gain_pct, current_value)
+                        tp_event.set()
+                except Exception:
+                    pass
+
+        poll_task = asyncio.create_task(_poll_tp())
+
         # Race: take profit vs hold timer
         hold_task = asyncio.create_task(asyncio.sleep(config.HOLD_TIME_SECONDS))
         tp_task   = asyncio.create_task(tp_event.wait())
@@ -104,6 +133,7 @@ class PositionManager:
         )
         for t in pending:
             t.cancel()
+        poll_task.cancel()
 
         if pos.closed:
             if self._monitor:
@@ -118,9 +148,9 @@ class PositionManager:
 
         for attempt in range(1, 4):
             try:
-                order_id, tx_b64 = await self._solana.sell_all(pos.mint, pos.token_accounts)
+                order_id, tx_b64, needs_bc_v2 = await self._solana.sell_all(pos.mint, pos.token_accounts)
                 pos.sell_order_id = order_id
-                result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64)
+                result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64, needs_bc_v2=needs_bc_v2)
                 sol_back = float(result.get("output_amount", 0)) / config.LAMPORTS_PER_SOL
                 self._state.close_position(pos.mint, sol_back, success=True)
                 self._state.log("sell", pos.mint, pos.symbol,

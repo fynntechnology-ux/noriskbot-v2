@@ -25,6 +25,7 @@ MIN_BUY_BUFFER_LAMPORTS:     int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",     
 
 # RPC endpoints
 HELIUS_RPC_HTTP:    str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+FALLBACK_RPC_HTTP:  str = os.getenv("FALLBACK_RPC_HTTP", "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c")
 HELIUS_RPC_WS:      str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
 HELIUS_SENDER_URL:   str = os.getenv("HELIUS_SENDER_URL",   "http://ams-sender.helius-rpc.com/fast")
 HELIUS_SENDER_URL_2: str = os.getenv("HELIUS_SENDER_URL_2", "http://fra-sender.helius-rpc.com/fast")

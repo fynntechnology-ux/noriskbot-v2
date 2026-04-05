@@ -217,16 +217,27 @@ class SolanaClient:
     async def _rpc(self, body: dict, timeout: float = 5.0) -> dict:
         body.setdefault("jsonrpc", "2.0")
         body.setdefault("id", 1)
-        async with self._session.post(
-            config.HELIUS_RPC_HTTP,
-            json=body,
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            data = await resp.json(content_type=None)
-        if "error" in data:
-            raise RuntimeError(f"RPC error: {data['error']}")
-        return data.get("result", data)
+        urls = [config.HELIUS_RPC_HTTP, config.FALLBACK_RPC_HTTP] if hasattr(config, "FALLBACK_RPC_HTTP") else [config.HELIUS_RPC_HTTP]
+        last_exc = None
+        for url in urls:
+            try:
+                async with self._session.post(
+                    url,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"RPC returned non-dict: {type(data)}")
+                if "error" in data:
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                return data.get("result", data)
+            except Exception as exc:
+                last_exc = exc
+                if url != urls[-1]:
+                    log.debug("_rpc failed on %s: %s — retrying on fallback", url.split("/")[2][:20], exc)
+        raise last_exc
 
     async def _get_token_balance(self, mint_str: str) -> tuple[int, float]:
         """
@@ -520,7 +531,7 @@ class SolanaClient:
             # BondingCurve layout: [0:8] disc, [8:16] vToken, [16:24] vSol,
             #   [24:32] realToken, [32:40] realSol, [40:48] totalSupply,
             #   [48:49] complete (bool), [49:81] creator (Pubkey)
-            creator_vault_str = str(static[4])  # fallback to static slot
+            creator_vault_str = str(static[4])  # PumpPortal's vault — authoritative
             try:
                 bc_info = await self._rpc({
                     "method": "getAccountInfo",
@@ -538,17 +549,17 @@ class SolanaClient:
                     bc_bytes = _b64.b64decode(bc_data_b64)
                     if len(bc_bytes) >= 81:
                         creator = Pubkey.from_bytes(bc_bytes[49:81])
-                        # Skip if creator is system program (uninitialized/stale BC data)
-                        if str(creator) == "11111111111111111111111111111111":
-                            log.warning("prefetch: creator=system_program at offset 49 for %s — using static[4] fallback",
-                                        mint_str[:8])
-                        else:
+                        if str(creator) != "11111111111111111111111111111111":
                             vault, _ = Pubkey.find_program_address(
                                 [b"creator-vault", bytes(creator)], _PUMP_OLD_PROG
                             )
-                            creator_vault_str = str(vault)
-                            log.debug("prefetch: derived creator_vault=%s for %s (creator=%s)",
-                                      creator_vault_str[:8], mint_str[:8], str(creator)[:8])
+                            derived = str(vault)
+                            if derived != creator_vault_str:
+                                log.warning("prefetch: BC-derived vault %s != static[4] %s for %s — keeping static[4]",
+                                            derived[:8], creator_vault_str[:8], mint_str[:8])
+                            else:
+                                log.debug("prefetch: creator_vault confirmed %s for %s",
+                                          creator_vault_str[:8], mint_str[:8])
             except WrongProgramError:
                 raise
             except Exception as exc:
@@ -609,8 +620,7 @@ class SolanaClient:
 
         byte[82]==0 → old layout → [14] bc_v2 only             (15 accounts)
         byte[82]==1 → new layout → [14] pump_const1 + [15] bc_v2 (16 accounts)
-        On RPC failure default to new layout (currently ~32% of tokens but growing).
-        Update the default once logs show a clear majority.
+        On RPC failure default to new layout (16 accounts) — safer since it's growing.
         """
         try:
             result = await self._rpc({
@@ -840,8 +850,8 @@ class SolanaClient:
 
         # ── Remaining accounts ────────────────────────────────────────────────
         # Verified from on-chain txs:
-        # byte[82]==0 (old): [14] bc_v2                              — 15 accounts
-        # byte[82]==1 (new): [14] 63EDqM8T (global const) + [15] bc_v2 — 16 accounts
+        # byte[82]==0 (old): [14] bc_v2                                         — 15 accounts
+        # byte[82]==1 (new): [14] per-user pump acct (pump_const1) + [15] bc_v2 — 16 accounts
         _PUMP_CONST1_GLOBAL = Pubkey.from_string("63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5")
         bc_v2, _ = Pubkey.find_program_address(
             [b"bonding-curve-v2", bytes(mint)], _PUMP_OLD_PROG
@@ -990,11 +1000,12 @@ class SolanaClient:
             tx_b64 = base64.b64encode(tx_bytes).decode()
             sig    = await self._send_via_rpc(tx_b64)
             log.info("SELL submitted (local)  sig=%s", sig)
-            return sig, tx_b64
+            return sig, tx_b64, needs_bc_v2
 
         raise RuntimeError(f"no token_accounts for sell of {mint_str}")
 
-    async def wait_for_order(self, sig: str, label: str = "", tx_b64: str = "") -> dict:
+    async def wait_for_order(self, sig: str, label: str = "", tx_b64: str = "",
+                              needs_bc_v2: bool | None = None) -> dict:
         """Poll getSignatureStatuses until confirmed or timeout.
 
         Rebroadcasts the tx every 2s when tx_b64 is provided so missed slots
@@ -1033,6 +1044,10 @@ class SolanaClient:
                         output_amount = 0
                         sol_spent     = 0
                         if label == "SELL":
+                            if needs_bc_v2 is not None:
+                                log.info("SELL confirmed | sig=%s layout=%s accounts=%d",
+                                         sig[:16], "old" if needs_bc_v2 else "new",
+                                         15 if needs_bc_v2 else 16)
                             output_amount = await self._get_sol_received(sig)
                         elif label == "BUY":
                             sol_spent = await self._get_sol_spent(sig)
