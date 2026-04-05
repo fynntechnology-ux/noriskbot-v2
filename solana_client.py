@@ -40,8 +40,9 @@ _ASSOC_TOKEN_PROG = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe
 _ASSOC_TOKEN_2022 = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 
-# Astralane tip recipient
-_ASTRALANE_TIP    = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
+# Tip recipients
+_ASTRALANE_TIP     = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
+_HELIUS_SENDER_TIP = Pubkey.from_string("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta")
 
 # Nonce account sysvar required by AdvanceNonceAccount instruction
 _SYSVAR_RECENT_BLOCKHASHES = Pubkey.from_string("SysvarRecentB1ockHashes11111111111111111111")
@@ -249,10 +250,10 @@ class SolanaClient:
         }, timeout=5)
         return result
 
-    async def _send_via_sender(self, tx_b64: str) -> str:
+    async def _send_via_sender(self, tx_b64: str, url: str | None = None) -> str:
         """Submit via Astralane sendTransaction (base64 encoded)."""
         async with self._session.post(
-            config.ASTRALANE_URL,
+            url or config.ASTRALANE_URL,
             json={
                 "jsonrpc": "2.0",
                 "id":      1,
@@ -272,6 +273,31 @@ class SolanaClient:
             raise RuntimeError(f"Astralane error: {data['error']}")
         if "result" not in data:
             raise RuntimeError(f"Astralane unexpected response: {data}")
+        return data["result"]
+
+    async def _send_via_helius_sender(self, tx_b64: str, url: str | None = None) -> str:
+        """Submit via Helius Sender /fast endpoint (staked connection)."""
+        async with self._session.post(
+            url or config.HELIUS_SENDER_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "sendTransaction",
+                "params":  [tx_b64, {
+                    "encoding":      "base64",
+                    "skipPreflight": True,
+                    "maxRetries":    0,
+                }],
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        log.debug("Helius Sender response (status=%d): %s", resp.status, data)
+        if "error" in data:
+            raise RuntimeError(f"Helius Sender error: {data['error']}")
+        if "result" not in data:
+            raise RuntimeError(f"Helius Sender unexpected response: {data}")
         return data["result"]
 
     async def _send_via_astralane(self, tx_bytes: bytes) -> str:
@@ -307,7 +333,10 @@ class SolanaClient:
         Without nonce, races Astralane sender and Helius RPC.
         """
         tasks = [
-            asyncio.create_task(self._send_via_sender(tx_b64)),
+            asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_URL)),
+            asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_AMS_URL)),
+            asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL)),
+            asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL_2)),
             asyncio.create_task(self._send_via_rpc(tx_b64)),
         ]
         if tx_bytes is not None and config.NONCE_ACCOUNT:
@@ -373,7 +402,7 @@ class SolanaClient:
         ))
         ix_init = initialize_nonce_account(InitializeNonceAccountParams(
             nonce_pubkey=nonce_pubkey,
-            authorized=self._pubkey,
+            authority=self._pubkey,
         ))
 
         msg = Message.new_with_blockhash(
@@ -683,11 +712,17 @@ class SolanaClient:
             data=bytes(buy_data),
         )
 
-        # ── Tip to Astralane — placed last (after buy) ───────────────────────
-        ix_tip = transfer(TransferParams(
+        # ── Tips — all senders paid; whichever lands it collects its tip ────────
+        # Both Astralane endpoints share the same tip address — one combined transfer
+        ix_tip_astralane = transfer(TransferParams(
             from_pubkey=self._pubkey,
             to_pubkey=_ASTRALANE_TIP,
-            lamports=config.SENDER_TIP_LAMPORTS,
+            lamports=config.SENDER_TIP_LAMPORTS + config.ASTRALANE_AMS_TIP_LAMPORTS,
+        ))
+        ix_tip_helius = transfer(TransferParams(
+            from_pubkey=self._pubkey,
+            to_pubkey=_HELIUS_SENDER_TIP,
+            lamports=config.HELIUS_SENDER_TIP_LAMPORTS,
         ))
 
         # ── AdvanceNonceAccount (prepended when durable nonce is configured) ────
@@ -706,7 +741,8 @@ class SolanaClient:
             )
             instructions.append(ix_advance)
 
-        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip])
+        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy,
+                             ix_tip_astralane, ix_tip_helius])
 
         # ── Legacy message — no ALT, immune to index drift ────────────────────
         msg = Message.new_with_blockhash(

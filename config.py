@@ -15,17 +15,22 @@ SLIPPAGE:                float = float(os.getenv("SLIPPAGE", "0.5"))
 MAX_CONCURRENT_POSITIONS:int   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 
 # Solana transaction fees
-COMPUTE_UNIT_LIMIT:       int = int(os.getenv("COMPUTE_UNIT_LIMIT",       "200000"))
-COMPUTE_UNIT_PRICE:       int = int(os.getenv("COMPUTE_UNIT_PRICE",       "500000"))  # micro-lamports/CU — buys
-SELL_COMPUTE_UNIT_PRICE:  int = int(os.getenv("SELL_COMPUTE_UNIT_PRICE",  "100000"))  # micro-lamports/CU — sells
-SENDER_TIP_LAMPORTS:      int = int(os.getenv("SENDER_TIP_LAMPORTS",      "1000000"))  # 0.001 SOL
-MIN_BUY_BUFFER_LAMPORTS:  int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",  "20000000")) # 0.02 SOL — covers pump.fun ~50% curve fee + tip
+COMPUTE_UNIT_LIMIT:          int = int(os.getenv("COMPUTE_UNIT_LIMIT",          "200000"))
+COMPUTE_UNIT_PRICE:          int = int(os.getenv("COMPUTE_UNIT_PRICE",          "500000"))  # micro-lamports/CU — buys
+SELL_COMPUTE_UNIT_PRICE:     int = int(os.getenv("SELL_COMPUTE_UNIT_PRICE",     "100000"))  # micro-lamports/CU — sells
+SENDER_TIP_LAMPORTS:         int = int(os.getenv("SENDER_TIP_LAMPORTS",         "1000000"))  # Astralane tip lamports
+HELIUS_SENDER_TIP_LAMPORTS:  int = int(os.getenv("HELIUS_SENDER_TIP_LAMPORTS",  "200000"))   # 0.0002 SOL
+MIN_BUY_BUFFER_LAMPORTS:     int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",     "20000000")) # 0.02 SOL
 
 # RPC endpoints
-HELIUS_RPC_HTTP:   str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-HELIUS_RPC_WS:     str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-ASTRALANE_URL:     str = os.getenv("ASTRALANE_URL", "https://fr.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
-ASTRALANE_API_KEY: str = os.getenv("ASTRALANE_API_KEY", "")
+HELIUS_RPC_HTTP:    str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_RPC_WS:      str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_SENDER_URL:   str = os.getenv("HELIUS_SENDER_URL",   "http://ams-sender.helius-rpc.com/fast")
+HELIUS_SENDER_URL_2: str = os.getenv("HELIUS_SENDER_URL_2", "http://fra-sender.helius-rpc.com/fast")
+ASTRALANE_URL:         str = os.getenv("ASTRALANE_URL",     "https://fr.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
+ASTRALANE_AMS_URL:     str = os.getenv("ASTRALANE_AMS_URL", "http://ams.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
+ASTRALANE_AMS_TIP_LAMPORTS: int = int(os.getenv("ASTRALANE_AMS_TIP_LAMPORTS", "20000"))  # 0.00002 SOL
+ASTRALANE_API_KEY:     str = os.getenv("ASTRALANE_API_KEY", "")
 
 # Durable nonce (optional) — set NONCE_ACCOUNT to enable pre-signed txs
 NONCE_ACCOUNT:     str = os.getenv("NONCE_ACCOUNT", "")
