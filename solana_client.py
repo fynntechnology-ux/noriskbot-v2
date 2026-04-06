@@ -441,8 +441,19 @@ class SolanaClient:
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=3),
         ) as resp:
-            data = await resp.json(content_type=None)
-        log.debug("sendIdeal response (status=%d): %s", resp.status, data)
+            raw = await resp.text()
+
+        log.info("sendIdeal response (status=%d): %s", resp.status, raw[:500])
+
+        if not raw or not raw.strip():
+            raise RuntimeError(f"sendIdeal HTTP {resp.status}: empty response body")
+
+        import json as _json
+        try:
+            data = _json.loads(raw)
+        except _json.JSONDecodeError as exc:
+            raise RuntimeError(f"sendIdeal HTTP {resp.status}: non-JSON body: {raw[:200]}") from exc
+
         if resp.status != 200:
             raise RuntimeError(f"sendIdeal HTTP {resp.status}: {data}")
         # Response: {"result": "<sig>"} or {"results": ["<sig_a>", "<sig_b>"]}
