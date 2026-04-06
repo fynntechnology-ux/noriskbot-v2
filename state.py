@@ -124,14 +124,20 @@ class BotState:
         self.total_buys += 1
         self.total_sol_spent += pos.sol_spent
 
-    def close_position(self, mint: str, sol_returned: float, success: bool):
+    def close_position(self, mint: str, sol_returned: float, success: bool,
+                        buy_failed: bool = False):
         pos = self.positions.get(mint)
         if pos:
             pos.closed = True
             pos.sell_result = "ok" if success else "failed"
             self.total_sells += 1
             self.total_sol_returned += sol_returned
-            if not success:
+            if buy_failed:
+                # Buy never landed — reverse the sol_spent we added at open
+                self.total_sol_spent -= pos.sol_spent
+                self.total_buys -= 1
+                self.total_sells -= 1
+            elif not success:
                 self.sell_failures += 1
 
     # ------------------------------------------------------------------

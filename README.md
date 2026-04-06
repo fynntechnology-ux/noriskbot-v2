@@ -39,23 +39,41 @@ New token discovery happens via **PumpPortal WebSocket** (`subscribeNewToken`). 
 
 ### Buying
 
-Once a signal fires the bot builds a **local buy transaction** directly against the pump.fun `6EF8` program (no PumpPortal API call in the hot path):
+Once a signal fires the bot builds **two local buy transaction variants** directly against the pump.fun `6EF8` program using a **dual-path submission strategy**:
 
-1. Blockhash and fresh bonding curve reserves are fetched in parallel from Helius Gatekeeper
+**Transaction Building:**
+1. Durable nonce and fresh bonding curve reserves are fetched in parallel from Helius RPC
 2. AMM math computes expected tokens out from live on-chain virtual reserves
 3. Token account is created with `createAccountWithSeed` + `InitializeAccount3` (cheaper than ATA, ~70k CU total)
-4. Transaction is signed and submitted via **Helius Sender** (`/fast` endpoint) and Helius RPC in parallel — first response wins
-5. A 1,000,000 lamport tip is included in the tx for Helius Sender priority
+4. Two transaction variants are built with the **same nonce**:
+   - **Tx A**: High priority fee (300,000 µL/CU) + low Astralane tip (10,000 lamports) → SWQoS validators
+   - **Tx B**: Low priority fee (1,000 µL/CU) + high Jito tip (1,000,000 lamports) → Jito bundle validators
+
+**Dual-Path Submission:**
+5. Both transactions are signed locally and submitted to Astralane `/iris` endpoint in parallel
+6. Astralane routes Tx A through the priority-fee pipeline and Tx B through Jito simultaneously
+7. Whichever transaction lands first consumes the durable nonce — the other becomes automatically invalid
+8. Only one transaction can execute (we pay only once)
+
+**Creator Vault Derivation:**
+- The bot extracts the creator wallet from PumpPortal's `subscribeNewToken` event
+- Creator vault PDA is derived directly from the creator wallet: `find_program_address([b"creator-vault", creator_pubkey], PUMP_PROGRAM)`
+- This eliminates the need for on-chain account scanning and works reliably across all bonding curve layouts
 
 ---
 
 ### Selling
 
-After **30 seconds** (configurable), the position is automatically sold via a **local sell transaction** directly against `6EF8`:
+Positions are managed with a **trailing stop loss** that activates after the position reaches **+10% gain**:
 
+1. Once activated, the bot tracks the peak value of the position
+2. If the position drops **5% from its peak** (drawdown), it triggers an automatic sell
+3. If the trailing stop doesn't trigger, the position auto-sells after the **hold timer** expires (default 50 seconds)
+
+**Sell execution:**
 1. Token balance is polled (up to 10s for settlement)
 2. Sell tx is built using the seed-derived token account as the source (same account created during buy)
-3. Submitted via Helius Gatekeeper RPC (no tip required — speed not critical for sells)
+3. Submitted via Astralane `/iris` endpoint
 
 If a sell fails, it retries up to **3 times** with a 3-second delay.
 
@@ -69,15 +87,23 @@ All settings are in `.env`:
 |----------|---------|-------------|
 | `WALLET_PRIVATE_KEY` | required | Base58 wallet private key |
 | `WALLET_ADDRESS` | required | Wallet public key |
-| `BUY_AMOUNT_SOL` | `0.06` | SOL to spend per buy |
-| `HOLD_TIME_SECONDS` | `30` | Seconds to hold before auto-sell |
-| `MAX_TOKEN_AGE_SECONDS` | `60` | Ignore tokens older than this |
-| `SLIPPAGE` | `0.10` | Slippage tolerance (10%) |
-| `MAX_CONCURRENT_POSITIONS` | `5` | Max open positions at once |
-| `COMPUTE_UNIT_PRICE` | `20000` | Priority fee micro-lamports/CU (buys) |
+| `NONCE_ACCOUNT` | required | Durable nonce account address |
+| `HELIUS_API_KEY` | required | Helius API key |
+| `ASTRALANE_API_KEY` | required | Astralane API key |
+| `BUY_AMOUNT_SOL` | `0.18` | SOL to spend per buy |
+| `HOLD_TIME_SECONDS` | `50` | Seconds to hold before auto-sell |
+| `TRAIL_STOP_PCT` | `5.0` | Trailing stop loss percentage (from peak) |
+| `TRAIL_ACTIVATE_PCT` | `10.0` | Gain % required to activate trailing stop |
+| `MAX_TOKEN_AGE_SECONDS` | `58` | Ignore tokens older than this |
+| `SLIPPAGE` | `0.25` | Slippage tolerance (25%) |
+| `MAX_CONCURRENT_POSITIONS` | `10` | Max open positions at once |
+| `IDEAL_HIGH_FEE_CU_PRICE` | `300000` | Tx A priority fee (µL/CU) |
+| `IDEAL_LOW_TIP_LAMPORTS` | `10000` | Tx A Astralane tip |
+| `IDEAL_LOW_FEE_CU_PRICE` | `1000` | Tx B priority fee (µL/CU) |
+| `IDEAL_HIGH_TIP_LAMPORTS` | `1000000` | Tx B Jito tip (0.001 SOL) |
 | `COMPUTE_UNIT_LIMIT` | `85000` | CU limit for buy transactions |
-| `SELL_COMPUTE_UNIT_PRICE` | `100000` | Priority fee micro-lamports/CU (sells) |
-| `SENDER_TIP_LAMPORTS` | `1000000` | Helius Sender tip per buy (0.001 SOL) |
+| `SELL_COMPUTE_UNIT_PRICE` | `100000` | Priority fee for sells (µL/CU) |
+| `ASTRALANE_AMS_TIP_LAMPORTS` | `100000` | Astralane tip for sells |
 
 ---
 
@@ -87,7 +113,7 @@ All settings are in `.env`:
 pip install -r requirements.txt
 
 cp .env.example .env
-# fill in WALLET_PRIVATE_KEY and WALLET_ADDRESS
+# fill in WALLET_PRIVATE_KEY, WALLET_ADDRESS, NONCE_ACCOUNT, HELIUS_API_KEY, ASTRALANE_API_KEY
 
 python3 main.py
 ```
@@ -103,8 +129,8 @@ main.py
  ├── bot.py              — orchestrates signals → buys → position tracking
  ├── pumpfun_monitor.py  — dual-feed signal detection (PumpPortal + Helius)
  ├── helius_feed.py      — Helius Gatekeeper accountSubscribe WebSocket
- ├── solana_client.py    — local tx building/signing, Helius Sender + RPC submission
- ├── position_manager.py — tracks open positions, fires auto-sell timer
+ ├── solana_client.py    — local tx building/signing, dual-path submission via Astralane /iris
+ ├── position_manager.py — tracks open positions, trailing stop loss + hold timer
  ├── config.py           — all settings from .env
  ├── state.py            — shared bot state (positions, event log)
  └── server.py           — dashboard web server
@@ -114,8 +140,12 @@ main.py
 
 ## Key implementation details
 
+- **Durable nonce accounts**: All transactions use a durable nonce instead of recent blockhash, allowing pre-signed transactions and eliminating blockhash expiry issues
+- **Dual-path submission**: Each buy submits two transaction variants simultaneously — one optimized for SWQoS validators (high priority fee), one for Jito (high tip). Whichever lands first wins.
 - **Token accounts** use `createAccountWithSeed(seed=mint[:8])` instead of ATA program — saves ~18k CU per buy
-- **Buy tx structure**: `[SetCULimit, SetCUPrice, createAccountWithSeed, InitializeAccount3, Buy, Tip]` — 17 accounts, ~70k CU consumed
-- **Sell tx structure**: `[SetCULimit, SetCUPrice, Sell]` — 16 accounts, ~56k CU consumed
-- **Fresh reserves**: bonding curve reserves are fetched on-chain at buy time (concurrent with blockhash) to avoid stale AMM calculations from PumpPortal
+- **Buy tx structure**: `[AdvanceNonceAccount, SetCULimit, SetCUPrice, createAccountWithSeed, InitializeAccount3, Buy, Tip]` — 17 accounts, ~70k CU consumed
+- **Sell tx structure**: `[SetCULimit, SetCUPrice, Sell, Tip]` — 16 accounts, ~56k CU consumed
+- **Fresh reserves**: bonding curve reserves are fetched on-chain at buy time (concurrent with nonce) to avoid stale AMM calculations
+- **Creator vault derivation**: Extracted from PumpPortal create events and derived as PDA — no on-chain scanning required
+- **Trailing stop loss**: Activates only after position reaches +10% gain, then sells on 5% drawdown from peak
 - **Program filter**: tokens using `MAyhSmzX` (new pump.fun wrapper) are skipped — different account layout

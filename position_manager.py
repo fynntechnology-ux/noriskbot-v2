@@ -75,11 +75,14 @@ class PositionManager:
                 if current_value > peak_value_holder[0]:
                     peak_value_holder[0] = current_value
 
-                # Trailing stop: sell if drawdown from peak exceeds 5%
+                # Trailing stop: only active once position is up 10%+ from entry
+                gain_pct = (peak_value_holder[0] / config.BUY_AMOUNT_SOL - 1.0) * 100.0
+                if gain_pct < config.TRAIL_ACTIVATE_PCT:
+                    return
                 drawdown_pct = (current_value / peak_value_holder[0] - 1.0) * 100.0
                 if drawdown_pct <= -config.TRAIL_STOP_PCT:
-                    log.info("TRAILING STOP  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%",
-                             mint, peak_value_holder[0], current_value, drawdown_pct)
+                    log.info("TRAILING STOP  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%  peak_gain=%.1f%%",
+                             mint, peak_value_holder[0], current_value, drawdown_pct, gain_pct)
                     stop_event.set()
 
             self._monitor.register_position(mint, _on_price_update)
@@ -123,11 +126,14 @@ class PositionManager:
                     if current_value > peak_value_holder[0]:
                         peak_value_holder[0] = current_value
 
-                    # Trailing stop: sell if drawdown from peak exceeds 5%
+                    # Trailing stop: only active once position is up 10%+ from entry
+                    gain_pct = (peak_value_holder[0] / config.BUY_AMOUNT_SOL - 1.0) * 100.0
+                    if gain_pct < config.TRAIL_ACTIVATE_PCT:
+                        continue
                     drawdown_pct = (current_value / peak_value_holder[0] - 1.0) * 100.0
-                    if drawdown_pct <= -5.0:
-                        log.info("TRAILING STOP (poll)  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%",
-                                 pos.mint, peak_value_holder[0], current_value, drawdown_pct)
+                    if drawdown_pct <= -config.TRAIL_STOP_PCT:
+                        log.info("TRAILING STOP (poll)  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%  peak_gain=%.1f%%",
+                                 pos.mint, peak_value_holder[0], current_value, drawdown_pct, gain_pct)
                         stop_event.set()
                 except Exception:
                     pass

@@ -96,7 +96,7 @@ class PumpSnipeBot:
             log.error("Buy failed on-chain for %s: %s", mint, exc)
             # Close the phantom position so sell_all isn't attempted on tokens we don't hold
             if mint in self._state.positions:
-                self._state.close_position(mint, 0.0, success=False)
+                self._state.close_position(mint, 0.0, success=False, buy_failed=True)
 
     async def run(self):
         log.info("=" * 60)
@@ -104,7 +104,7 @@ class PumpSnipeBot:
         log.info("  wallet        : %s", config.WALLET_ADDRESS)
         log.info("  buy amount    : %.3f SOL", config.BUY_AMOUNT_SOL)
         log.info("  hold time     : %ds", config.HOLD_TIME_SECONDS)
-        log.info("  trail stop    : -%.0f%% from peak", config.TRAIL_STOP_PCT)
+        log.info("  trail stop    : -%.0f%% from peak (activates at +%.0f%%)", config.TRAIL_STOP_PCT, config.TRAIL_ACTIVATE_PCT)
         log.info("  max token age : %ds", config.MAX_TOKEN_AGE_SECONDS)
         log.info("  trigger       : 0.0%% bonding curve (everyone sold out)")
         log.info("  slippage      : %.0f%%", config.SLIPPAGE * 100)

@@ -1,14 +1,14 @@
 """
 Direct on-chain Solana client for pump.fun trading.
 
-Transaction flow (Phase 3 — sendIdeal dual-path):
+Transaction flow (Phase 3 — dual-path via /iris):
   1. POST pumpportal.fun/api/trade-local once at token discovery → cache per-token accounts
   2. At signal time: build TWO tx variants with same nonce
        Tx A: high CU price + low Astralane tip  → SWQoS / priority-fee validators
        Tx B: low  CU price + high Jito tip      → Jito bundle validators
-  3. Sign both locally; submit via Astralane sendIdeal
-     Astralane routes A through priority pipeline and B through Jito simultaneously.
-     Whichever lands first consumes the nonce — the other auto-invalidates.
+  3. Sign both locally; submit both via Astralane /iris in parallel
+     Both share the same durable nonce — whichever lands first consumes it,
+     making the other automatically invalid.
 
 Fallback (if prefetch unavailable): use PumpPortal tx as before.
 """
@@ -100,7 +100,6 @@ class SolanaClient:
         self._nonce_lock             = None # asyncio.Lock, created in warmup
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
-        self._creator_vault_cache: dict[str, str] = {}  # mint -> creator_vault, permanent cache
         log.info("Wallet: %s", self._pubkey)
 
     async def close(self):
@@ -150,27 +149,6 @@ class SolanaClient:
         await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash(),
                              _prime_nonce(), self._fetch_pump_alt(), self.refresh_balance())
         asyncio.create_task(self._blockhash_refresher())
-
-    async def warmup_creator_vaults(self, pairs: list[tuple[str, str]]):
-        """
-        Pre-derive and cache creator_vault for known tokens at startup.
-        pairs = [(bonding_curve_str, mint_str), ...]
-
-        Called during warmup to avoid RPC scan cost during live buy signals.
-        """
-        tasks = [
-            self._derive_creator_vault(bc, mint)
-            for bc, mint in pairs
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        cached = 0
-        for (bc, mint), result in zip(pairs, results):
-            if isinstance(result, Exception):
-                log.warning("creator_vault warmup failed for %s: %s", mint[:8], result)
-            else:
-                cached += 1
-        if cached:
-            log.info("creator_vault cache warmed: %d tokens", cached)
 
     async def _fetch_pump_alt(self):
         """Fetch and parse the pump.fun Address Lookup Table once at startup."""
@@ -262,54 +240,6 @@ class SolanaClient:
                 if url != urls[-1]:
                     log.debug("_rpc failed on %s: %s — retrying on fallback", url.split("/")[2][:20], exc)
         raise last_exc
-
-    async def _derive_creator_vault(self, bonding_curve_str: str, mint_str: str) -> str:
-        """
-        Derive creator_vault by scanning BC bytes for a pubkey that produces a valid PDA.
-        Cached permanently per mint — creator_vault never changes after token creation.
-
-        Scans all 32-byte-aligned offsets after the 8-byte discriminator, derives the
-        PDA with seeds [b"creator-vault", candidate_pubkey], and verifies the vault
-        exists on-chain. Works for both old and new BC layouts without hardcoded offsets.
-        """
-        if mint_str in self._creator_vault_cache:
-            return self._creator_vault_cache[mint_str]
-
-        bc_info = await self._rpc({
-            "method": "getAccountInfo",
-            "params": [bonding_curve_str, {"encoding": "base64"}]
-        })
-        bc_val = (bc_info or {}).get("value") or {}
-        bc_data_b64 = (bc_val.get("data") or [None])[0]
-        if not bc_data_b64:
-            raise ValueError(f"BC account data not found for {mint_str[:8]}")
-
-        bc_bytes = base64.b64decode(bc_data_b64)
-
-        # Try all 32-byte-aligned offsets after discriminator
-        for offset in range(8, len(bc_bytes) - 31, 1):
-            try:
-                candidate = Pubkey.from_bytes(bc_bytes[offset:offset+32])
-                if candidate == Pubkey.default():
-                    continue
-                vault, _ = Pubkey.find_program_address(
-                    [b"creator-vault", bytes(candidate)], _PUMP_OLD_PROG
-                )
-                # Verify vault exists on-chain (non-null, even if zero balance)
-                vault_info = await self._rpc({
-                    "method": "getAccountInfo",
-                    "params": [str(vault), {"encoding": "base64"}]
-                })
-                if (vault_info or {}).get("value") is not None:
-                    vault_str = str(vault)
-                    self._creator_vault_cache[mint_str] = vault_str
-                    log.debug("creator_vault derived: %s for %s (offset %d)",
-                              vault_str[:8], mint_str[:8], offset)
-                    return vault_str
-            except Exception:
-                continue
-
-        raise ValueError(f"creator_vault not found for {mint_str[:8]}")
 
     async def _get_token_balance(self, mint_str: str) -> tuple[int, float]:
         """
@@ -405,69 +335,6 @@ class SolanaClient:
         if not result:
             raise RuntimeError(f"Astralane unexpected response: {data}")
         return result
-
-    async def _send_via_ideal(
-        self,
-        tx_a_bytes: bytes,  # high fee + low tip  → SWQoS path
-        tx_b_bytes: bytes,  # low fee  + high tip → Jito path
-    ) -> str:
-        """
-        Submit two signed tx variants via Astralane sendIdeal.
-
-        Astralane routes Tx A through the SWQoS/priority-fee pipeline and
-        Tx B through the Jito bundle pipeline simultaneously.  Both txs share
-        the same durable nonce — whichever lands first consumes it, making the
-        other automatically invalid.  We pay only once.
-
-        Returns the signature of whichever tx Astralane accepted first
-        (either path — both produce the same logical trade).
-        """
-        tx_a_b64 = base64.b64encode(tx_a_bytes).decode()
-        tx_b_b64 = base64.b64encode(tx_b_bytes).decode()
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {config.ASTRALANE_API_KEY}",
-        }
-        payload = {
-            "transactions": [tx_a_b64, tx_b_b64],
-            "options": {
-                "encoding":      "base64",
-                "skipPreflight": True,
-            },
-        }
-        async with self._session.post(
-            config.ASTRALANE_IDEAL_URL,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=3),
-        ) as resp:
-            raw = await resp.text()
-
-        log.info("sendIdeal response (status=%d): %s", resp.status, raw[:500])
-
-        if not raw or not raw.strip():
-            raise RuntimeError(f"sendIdeal HTTP {resp.status}: empty response body")
-
-        import json as _json
-        try:
-            data = _json.loads(raw)
-        except _json.JSONDecodeError as exc:
-            raise RuntimeError(f"sendIdeal HTTP {resp.status}: non-JSON body: {raw[:200]}") from exc
-
-        if resp.status != 200:
-            raise RuntimeError(f"sendIdeal HTTP {resp.status}: {data}")
-        # Response: {"result": "<sig>"} or {"results": ["<sig_a>", "<sig_b>"]}
-        if isinstance(data, dict):
-            if "result" in data:
-                return data["result"]
-            if "results" in data and data["results"]:
-                # Return the first non-null signature
-                for r in data["results"]:
-                    if r:
-                        return r
-            if "error" in data:
-                raise RuntimeError(f"sendIdeal error: {data['error']}")
-        raise RuntimeError(f"sendIdeal unexpected response: {data}")
 
     async def _fetch_nonce_from_chain(self) -> str:
         """Read the durable nonce value directly from the nonce account on-chain."""
@@ -575,7 +442,7 @@ class SolanaClient:
 
     # ── Local transaction building ─────────────────────────────────────────────
 
-    async def prefetch_token_accounts(self, mint_str: str) -> TokenAccounts | None:
+    async def prefetch_token_accounts(self, mint_str: str, **_kw) -> TokenAccounts | None:
         """
         Call PumpPortal trade-local for a dummy buy to obtain the per-token
         static account list, then extract the 5 accounts we need.
@@ -615,11 +482,11 @@ class SolanaClient:
                 log.warning("prefetch: unexpected account count %d for %s",
                             len(static), mint_str[:8])
                 return None
-            # Verify BC ownership and derive creator_vault via brute-force scan
+            # Verify BC ownership
             try:
                 bc_info = await self._rpc({
                     "method": "getAccountInfo",
-                    "params": [str(static[2]), {"encoding": "base64"}]
+                    "params": [str(static[2]), {"encoding": "base64", "commitment": "processed"}]
                 })
                 bc_val = (bc_info or {}).get("value") or {}
                 owner  = bc_val.get("owner", "")
@@ -627,13 +494,14 @@ class SolanaClient:
                     log.debug("prefetch: bc owned by %s (not 6EF8) for %s — skipping",
                               owner[:8], mint_str[:8])
                     raise WrongProgramError(owner)
-                creator_vault_str = await self._derive_creator_vault(str(static[2]), mint_str)
             except WrongProgramError:
                 raise
             except Exception as exc:
-                log.warning("prefetch: creator_vault derivation failed for %s: %s — using static[4]",
-                            mint_str[:8], exc)
-                creator_vault_str = str(static[4])
+                log.warning("prefetch: BC ownership check failed for %s: %s", mint_str[:8], exc)
+
+            # Use PumpPortal's static[4] — authoritative creator_vault
+            creator_vault_str = str(static[4])
+            log.info("prefetch %s  creator_vault=static[4]=%s", mint_str[:8], creator_vault_str[:12])
 
             return TokenAccounts(
                 assoc_user          = str(static[1]),
@@ -757,7 +625,7 @@ class SolanaClient:
 
         cu_price and tip_lamports override config defaults when provided,
         allowing _build_local_buy_tx to be called twice with different fee
-        profiles for sendIdeal dual-path submission.
+        profiles for dual-path /iris submission.
 
         Instructions:
           1. SetComputeUnitLimit
@@ -979,7 +847,7 @@ class SolanaClient:
         # Fetch nonce and fresh on-chain reserves in parallel
         t_fetch_start = time.perf_counter()
         if not config.NONCE_ACCOUNT:
-            raise RuntimeError("sendIdeal requires NONCE_ACCOUNT — set it in .env")
+            raise RuntimeError("dual-path buy requires NONCE_ACCOUNT — set it in .env")
         blockhash, fresh_reserves = await asyncio.gather(
             self._fetch_nonce(),
             self._fetch_bc_reserves(token_accounts.bonding_curve),
@@ -1015,18 +883,35 @@ class SolanaClient:
         )
 
         log.info(
-            "BUY  sendIdeal  TxA(fee=%d µL/CU tip=%d) TxB(fee=%d µL/CU tip=%d)",
+            "BUY  dual-path iris  TxA(fee=%d µL/CU tip=%d) TxB(fee=%d µL/CU tip=%d)",
             config.IDEAL_HIGH_FEE_CU_PRICE, config.IDEAL_LOW_TIP_LAMPORTS,
             config.IDEAL_LOW_FEE_CU_PRICE,  config.IDEAL_HIGH_TIP_LAMPORTS,
         )
 
-        sig = await self._send_via_ideal(tx_a, tx_b)
+        # Submit both tx variants via /iris in parallel — first accepted sig wins
+        results = await asyncio.gather(
+            self._send_via_astralane(tx_a),
+            self._send_via_astralane(tx_b),
+            return_exceptions=True,
+        )
+        sigs = []
+        for i, r in enumerate(results):
+            label = "TxA" if i == 0 else "TxB"
+            if isinstance(r, Exception):
+                log.warning("BUY  %s failed: %s", label, r)
+            else:
+                log.info("BUY  %s accepted: %s", label, r)
+                sigs.append(r)
+        if not sigs:
+            raise RuntimeError(f"Both tx paths failed: A={results[0]}, B={results[1]}")
         t_total = time.perf_counter() - t0
-        log.info("BUY  submitted (sendIdeal)  sig=%s  total_time=%.3fs", sig, t_total)
+        log.info("BUY  submitted (dual-path iris)  sigs=%s  total_time=%.3fs",
+                 [s[:16] for s in sigs], t_total)
 
         # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
         self.invalidate_nonce()
-        return sig
+        # Return first sig as primary, attach all sigs for multi-sig polling
+        return sigs[0] + "|" + ",".join(sigs)
 
     async def _fetch_ata_balance(self, mint_str: str) -> int:
         """Fetch raw token balance directly from the seed-derived ATA we created.
@@ -1082,11 +967,18 @@ class SolanaClient:
                               needs_bc_v2: bool | None = None) -> dict:
         """Poll getSignatureStatuses until confirmed or timeout.
 
-        Rebroadcasts the tx every 2s when tx_b64 is provided so missed slots
-        don't cause a timeout. For SELL transactions, also fetches the confirmed
-        tx to read the wallet's SOL delta for P&L tracking.
+        sig may contain multiple signatures separated by "|" (primary|all_csv).
+        Polls all signatures — whichever confirms first wins.
         """
-        timeout_s      = 60 if label == "BUY" else 60
+        # Parse multi-sig format: "primary|sig1,sig2"
+        if "|" in sig:
+            primary, all_csv = sig.split("|", 1)
+            all_sigs = [s for s in all_csv.split(",") if s]
+        else:
+            primary = sig
+            all_sigs = [sig]
+
+        timeout_s      = 15 if label == "BUY" else 15
         deadline       = time.time() + timeout_s
         last_broadcast = time.time()
 
@@ -1095,36 +987,38 @@ class SolanaClient:
                 try:
                     await self._send_via_rpc(tx_b64)
                     last_broadcast = time.time()
-                    log.debug("Rebroadcast %s %s", label, sig[:16])
+                    log.debug("Rebroadcast %s %s", label, primary[:16])
                 except Exception:
                     pass
 
             try:
                 result   = await self._rpc({
                     "method": "getSignatureStatuses",
-                    "params": [[sig], {"searchTransactionHistory": True}],
+                    "params": [all_sigs, {"searchTransactionHistory": True}],
                 }, timeout=3)
-                statuses = result.get("value", [None])
-                status   = statuses[0] if statuses else None
-                if status:
+                statuses = result.get("value", [])
+                for idx, status in enumerate(statuses):
+                    if not status:
+                        continue
+                    found_sig = all_sigs[idx]
                     if status.get("err"):
                         raise RuntimeError(
-                            f"TX {sig[:16]} {label} failed: {status['err']}"
+                            f"TX {found_sig[:16]} {label} failed: {status['err']}"
                         )
                     conf = status.get("confirmationStatus", "")
                     if conf in ("processed", "confirmed", "finalized"):
-                        log.info("TX %s… %s  (%s)", sig[:16], label, conf)
+                        log.info("TX %s… %s  (%s)", found_sig[:16], label, conf)
                         output_amount = 0
                         sol_spent     = 0
                         if label == "SELL":
                             if needs_bc_v2 is not None:
                                 log.info("SELL confirmed | sig=%s layout=%s accounts=%d",
-                                         sig[:16], "old" if needs_bc_v2 else "new",
+                                         found_sig[:16], "old" if needs_bc_v2 else "new",
                                          15 if needs_bc_v2 else 16)
-                            output_amount = await self._get_sol_received(sig)
+                            output_amount = await self._get_sol_received(found_sig)
                         elif label == "BUY":
-                            sol_spent = await self._get_sol_spent(sig)
-                        return {"sig": sig, "status": conf, "output_amount": output_amount, "sol_spent": sol_spent}
+                            sol_spent = await self._get_sol_spent(found_sig)
+                        return {"sig": found_sig, "status": conf, "output_amount": output_amount, "sol_spent": sol_spent}
             except RuntimeError as exc:
                 if "-32429" in str(exc):
                     log.debug("Status poll rate limited — waiting 5s")
@@ -1134,20 +1028,21 @@ class SolanaClient:
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
             await asyncio.sleep(0.25)
-        # Diagnostic: check if tx actually landed but polling missed it
-        try:
-            tx_check = await self._rpc({
-                "method": "getTransaction",
-                "params": [sig, {"encoding": "json", "commitment": "confirmed",
-                                 "maxSupportedTransactionVersion": 0}],
-            }, timeout=5)
-            if tx_check and tx_check.get("value"):
-                log.error("TIMEOUT but tx found on-chain: sig=%s", sig[:16])
-            else:
-                log.error("TIMEOUT — tx %s never landed (not found on-chain)", sig[:16])
-        except Exception:
-            log.error("TIMEOUT — tx %s never landed (not found on-chain)", sig[:16])
-        raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
+        # Diagnostic: check if any tx actually landed but polling missed it
+        for check_sig in all_sigs:
+            try:
+                tx_check = await self._rpc({
+                    "method": "getTransaction",
+                    "params": [check_sig, {"encoding": "json", "commitment": "confirmed",
+                                           "maxSupportedTransactionVersion": 0}],
+                }, timeout=5)
+                if tx_check and tx_check.get("value"):
+                    log.error("TIMEOUT but tx found on-chain: sig=%s", check_sig[:16])
+                    return {"sig": check_sig, "status": "confirmed", "output_amount": 0, "sol_spent": 0}
+            except Exception:
+                pass
+        log.error("TIMEOUT — none of %d sigs landed on-chain", len(all_sigs))
+        raise RuntimeError(f"TX {primary[:16]} {label} timed out after {timeout_s}s")
 
     async def _get_sol_spent(self, sig: str) -> float:
         """Return actual SOL debited from wallet for a buy tx (in SOL, not lamports)."""
@@ -1189,6 +1084,8 @@ class SolanaClient:
             post = meta.get("postBalances", [])
             if pre and post:
                 delta = post[0] - pre[0]
+                log.info("SELL P&L  sig=%s  delta=%d lamports (%.4f SOL)",
+                         sig[:16], delta, delta / 1e9)
                 _EXPECTED_CONST1 = "63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5"
                 try:
                     keys = tx["transaction"]["message"]["accountKeys"]
@@ -1203,6 +1100,8 @@ class SolanaClient:
                 except Exception:
                     pass
                 return max(delta, 0)
+            else:
+                log.warning("SELL P&L  sig=%s  no balance data in tx", sig[:16])
         except Exception as exc:
-            log.debug("_get_sol_received failed for %s: %s", sig[:16], exc)
+            log.warning("_get_sol_received failed for %s: %s", sig[:16], exc)
         return 0

@@ -43,7 +43,7 @@ VSOL_INIT = 30.0
 VSOL_MAX  = 793.0
 
 # Thresholds
-PEAK_SOL = 1.5    # vSol must rise at least 1.5 SOL above init before we care
+PEAK_SOL = 3.0    # vSol must rise at least 3 SOL above init before we care
 ZERO_SOL = 0.01   # trigger when vSol is within 0.01 SOL of init
 MIN_TRADES = 3    # minimum number of buy transactions required
 
@@ -68,14 +68,16 @@ class TokenWatch:
     """Per-token state tracked from account updates."""
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
-                 "vtoken_raw", "accounts",
+                 "vtoken_raw", "accounts", "creator_wallet",
                  "last_dashboard_update", "vsol_timestamp", "trade_count")
 
-    def __init__(self, mint: str, symbol: str, name: str, created_at: float):
+    def __init__(self, mint: str, symbol: str, name: str, created_at: float,
+                 creator_wallet: str = ""):
         self.mint         = mint
         self.symbol       = symbol
         self.name         = name
         self.created_at   = created_at
+        self.creator_wallet = creator_wallet
         self.vsol         = VSOL_INIT
         self.peak_vsol      = VSOL_INIT
         self.had_activity   = False
@@ -143,16 +145,16 @@ class PumpFunMonitor:
         Call PumpPortal trade-local for a dummy buy to obtain the static account
         list for this token, then cache it on the TokenWatch.
 
-        Accounts extracted from the static list (indices into the non-ALT portion):
-          [1] assoc_user          — user's token ATA
-          [2] bonding_curve       — bonding curve PDA
-          [3] assoc_bonding_curve — bonding curve's ATA
-          [4] creator_vault       — creator vault PDA
-          [6] unk16               — FLASHX8 per-token account
+        If the create event provided a creator_wallet, derive creator_vault PDA
+        from it (authoritative). Otherwise fall back to static[4].
         """
+        watch = self._watching.get(mint)
+        if not watch:
+            return
         try:
-            accounts = await self._solana_client.prefetch_token_accounts(mint)
-            watch = self._watching.get(mint)
+            accounts = await self._solana_client.prefetch_token_accounts(
+                mint, creator_wallet=watch.creator_wallet,
+            )
             if watch and accounts:
                 watch.accounts = accounts
                 log.debug("%s  accounts prefetched", mint[:8])
@@ -319,13 +321,18 @@ class PumpFunMonitor:
         created_at = float(msg.get("timestamp", time.time()))
         age        = time.time() - created_at
 
+        # Extract creator wallet from PumpPortal create event
+        creator_wallet = msg.get("traderPublicKey") or msg.get("creator") or ""
+        if not creator_wallet:
+            log.warning("create event missing creator for %s — keys: %s", mint[:8], list(msg.keys()))
+
         if age > config.MAX_TOKEN_AGE_SECONDS:
             log.debug("Stale event %s (age=%.0fs) — skipping", mint[:8], age)
             return
 
-        log.info("Tracking  %s  sym=%s  name=%s", mint, symbol, name)
+        log.info("Tracking  %s  sym=%s  name=%s  creator=%s", mint, symbol, name, creator_wallet[:12] if creator_wallet else "???")
 
-        watch = TokenWatch(mint, symbol, name, created_at)
+        watch = TokenWatch(mint, symbol, name, created_at, creator_wallet=creator_wallet)
         if "vSolInBondingCurve" in msg:
             watch.vsol      = float(msg["vSolInBondingCurve"])
             watch.peak_vsol = watch.vsol
