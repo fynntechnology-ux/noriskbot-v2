@@ -23,6 +23,15 @@ SENDER_TIP_LAMPORTS:         int = int(os.getenv("SENDER_TIP_LAMPORTS",         
 HELIUS_SENDER_TIP_LAMPORTS:  int = int(os.getenv("HELIUS_SENDER_TIP_LAMPORTS",  "200000"))   # 0.0002 SOL
 MIN_BUY_BUFFER_LAMPORTS:     int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",     "20000000")) # 0.02 SOL
 
+# sendIdeal dual-path fee config
+# Tx A: high priority fee + low tip  → SWQoS / priority-fee validators
+# Tx B: low priority fee  + high tip → Jito bundle validators
+# Whichever path wins, the nonce is consumed and the other tx becomes invalid.
+IDEAL_HIGH_FEE_CU_PRICE: int = int(os.getenv("IDEAL_HIGH_FEE_CU_PRICE", "300000"))   # µL/CU for Tx A
+IDEAL_LOW_TIP_LAMPORTS:   int = int(os.getenv("IDEAL_LOW_TIP_LAMPORTS",   "10000"))    # Astralane min tip for Tx A
+IDEAL_LOW_FEE_CU_PRICE:   int = int(os.getenv("IDEAL_LOW_FEE_CU_PRICE",  "1000"))     # µL/CU for Tx B
+IDEAL_HIGH_TIP_LAMPORTS:  int = int(os.getenv("IDEAL_HIGH_TIP_LAMPORTS",  "1000000"))  # Jito tip for Tx B (0.001 SOL)
+
 # RPC endpoints
 HELIUS_API_KEY:      str = os.environ["HELIUS_API_KEY"]
 HELIUS_RPC_HTTP:     str = f"https://beta.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -33,6 +42,7 @@ HELIUS_SENDER_URL_2: str = os.getenv("HELIUS_SENDER_URL_2", "http://fra-sender.h
 ASTRALANE_API_KEY:   str = os.environ["ASTRALANE_API_KEY"]
 ASTRALANE_URL:       str = f"https://fr.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
 ASTRALANE_AMS_URL:   str = f"http://ams.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
+ASTRALANE_IDEAL_URL: str = f"https://fr.gateway.astralane.io/sendIdeal?api-key={ASTRALANE_API_KEY}"
 ASTRALANE_AMS_TIP_LAMPORTS: int = int(os.getenv("ASTRALANE_AMS_TIP_LAMPORTS", "20000"))  # 0.00002 SOL
 
 # Durable nonce (optional) — set NONCE_ACCOUNT to enable pre-signed txs

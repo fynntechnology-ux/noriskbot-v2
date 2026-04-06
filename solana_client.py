@@ -1,11 +1,14 @@
 """
 Direct on-chain Solana client for pump.fun trading.
 
-Transaction flow (Phase 2 — local build):
+Transaction flow (Phase 3 — sendIdeal dual-path):
   1. POST pumpportal.fun/api/trade-local once at token discovery → cache per-token accounts
-  2. At signal time: build tx locally with tip + priority fee + ATA init + buy instruction
-  3. Sign locally with our keypair
-  4. Submit via Helius Sender (staked connection, priority inclusion)
+  2. At signal time: build TWO tx variants with same nonce
+       Tx A: high CU price + low Astralane tip  → SWQoS / priority-fee validators
+       Tx B: low  CU price + high Jito tip      → Jito bundle validators
+  3. Sign both locally; submit via Astralane sendIdeal
+     Astralane routes A through priority pipeline and B through Jito simultaneously.
+     Whichever lands first consumes the nonce — the other auto-invalidates.
 
 Fallback (if prefetch unavailable): use PumpPortal tx as before.
 """
@@ -429,9 +432,63 @@ class SolanaClient:
             raise RuntimeError(f"Astralane unexpected response: {data}")
         return result
 
+    async def _send_via_ideal(
+        self,
+        tx_a_bytes: bytes,  # high fee + low tip  → SWQoS path
+        tx_b_bytes: bytes,  # low fee  + high tip → Jito path
+    ) -> str:
+        """
+        Submit two signed tx variants via Astralane sendIdeal.
+
+        Astralane routes Tx A through the SWQoS/priority-fee pipeline and
+        Tx B through the Jito bundle pipeline simultaneously.  Both txs share
+        the same durable nonce — whichever lands first consumes it, making the
+        other automatically invalid.  We pay only once.
+
+        Returns the signature of whichever tx Astralane accepted first
+        (either path — both produce the same logical trade).
+        """
+        tx_a_b64 = base64.b64encode(tx_a_bytes).decode()
+        tx_b_b64 = base64.b64encode(tx_b_bytes).decode()
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {config.ASTRALANE_API_KEY}",
+        }
+        payload = {
+            "transactions": [tx_a_b64, tx_b_b64],
+            "options": {
+                "encoding":      "base64",
+                "skipPreflight": True,
+            },
+        }
+        async with self._session.post(
+            config.ASTRALANE_IDEAL_URL,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        log.debug("sendIdeal response (status=%d): %s", resp.status, data)
+        if resp.status != 200:
+            raise RuntimeError(f"sendIdeal HTTP {resp.status}: {data}")
+        # Response: {"result": "<sig>"} or {"results": ["<sig_a>", "<sig_b>"]}
+        if isinstance(data, dict):
+            if "result" in data:
+                return data["result"]
+            if "results" in data and data["results"]:
+                # Return the first non-null signature
+                for r in data["results"]:
+                    if r:
+                        return r
+            if "error" in data:
+                raise RuntimeError(f"sendIdeal error: {data['error']}")
+        raise RuntimeError(f"sendIdeal unexpected response: {data}")
+
     async def _send_fast(self, tx_b64: str, tx_bytes: bytes | None = None) -> str:
         """Race all available endpoints in parallel — first successful response wins.
 
+        Kept as fallback for sell transactions and PumpPortal-path buys.
+        For local buys with nonce, use _send_via_ideal() instead.
         When nonce is enabled, uses authenticated Astralane + Helius Sender + Helius RPC.
         Without nonce, uses unauthenticated Astralane sender + Helius RPC.
         """
@@ -736,6 +793,8 @@ class SolanaClient:
         vtoken_raw:    int,
         vsol_lamports: int,
         blockhash:     str,
+        cu_price:      int | None = None,
+        tip_lamports:  int | None = None,
     ) -> bytes:
         """
         Build and sign a pump.fun buy transaction locally using Legacy format.
@@ -743,20 +802,25 @@ class SolanaClient:
         Legacy (not V0) — no ALT, no index drift if pump.fun updates the table.
         All global constants are hardcoded by address.
 
+        cu_price and tip_lamports override config defaults when provided,
+        allowing _build_local_buy_tx to be called twice with different fee
+        profiles for sendIdeal dual-path submission.
+
         Instructions:
           1. SetComputeUnitLimit
           2. SetComputeUnitPrice
           3. SystemProgram::createAccountWithSeed  (create user token account)
           4. Token-2022::InitializeAccount3        (init token account)
           5. pump.fun buy  (17 accounts)
-          6. SystemProgram::transfer  (tip to Helius Sender)
+          6. SystemProgram::transfer  (Astralane tip)
         """
         from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
         from solders.system_program import transfer, TransferParams, create_account_with_seed, CreateAccountWithSeedParams
 
+        effective_cu_price   = cu_price      if cu_price      is not None else config.COMPUTE_UNIT_PRICE
+        effective_tip        = tip_lamports  if tip_lamports  is not None else config.SENDER_TIP_LAMPORTS
+
         mint        = Pubkey.from_string(mint_str)
-        # Token account derived via seed — same method as competitor, no ATA program needed.
-        # seed = first 8 chars of mint string; address = createWithSeed(wallet, seed, Token-2022)
         token_seed  = mint_str[:8]
         user_token  = Pubkey.create_with_seed(self._pubkey, token_seed, _TOKEN_2022)
         bc          = Pubkey.from_string(accounts.bonding_curve)
@@ -765,7 +829,6 @@ class SolanaClient:
         pump_const1 = Pubkey.from_string(accounts.pump_const1)
         unk16       = Pubkey.from_string(accounts.unk16)
 
-        # Global constants — hardcoded by address, immune to ALT index drift
         _GLOBAL    = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
         _FEE_RECIP = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
         _CONST10   = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
@@ -773,12 +836,9 @@ class SolanaClient:
         _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 
-        # ── Compute budget ─────────────────────────────────────────────────────
         ix_cu_limit = set_compute_unit_limit(config.COMPUTE_UNIT_LIMIT)
-        ix_cu_price = set_compute_unit_price(config.COMPUTE_UNIT_PRICE)
+        ix_cu_price = set_compute_unit_price(effective_cu_price)
 
-        # ── Create token account via seed (cheaper than ATA program) ──────────
-        # Min rent for a 165-byte standard token account
         TOKEN_ACCT_RENT = 2039280
         ix_create = create_account_with_seed(CreateAccountWithSeedParams(
             from_pubkey=self._pubkey,
@@ -790,8 +850,6 @@ class SolanaClient:
             owner=_TOKEN_2022,
         ))
 
-        # ── Initialize token account (Token-2022 InitializeAccount3) ──────────
-        # Discriminator 18, then 32-byte owner pubkey in data; no ATA overhead
         ix_init = Instruction(
             program_id=_TOKEN_2022,
             accounts=[
@@ -801,9 +859,8 @@ class SolanaClient:
             data=bytes([18]) + bytes(self._pubkey),
         )
 
-        # ── AMM calculation ────────────────────────────────────────────────────
         tokens_out   = int(vtoken_raw * sol_lamports // (vsol_lamports + sol_lamports))
-        max_sol_cost = sol_lamports * 2  # generous ceiling — actual spend determined by AMM
+        max_sol_cost = sol_lamports * 2
 
         buy_data = (
             _BUY_DISC
@@ -811,7 +868,6 @@ class SolanaClient:
             + struct.pack("<Q", max_sol_cost)
         )
 
-        # ── Buy instruction — 17 accounts, no _FEE_CONFIG, unk16 readonly ─────
         ix_buy = Instruction(
             program_id=_PUMP_OLD_PROG,
             accounts=[
@@ -836,39 +892,29 @@ class SolanaClient:
             data=bytes(buy_data),
         )
 
-        # ── Tips — all senders paid; whichever lands it collects its tip ────────
-        # Both Astralane endpoints share the same tip address — one combined transfer
-        ix_tip_astralane = transfer(TransferParams(
+        # Single Astralane tip — amount varies by variant (low for Tx A, high for Tx B)
+        ix_tip = transfer(TransferParams(
             from_pubkey=self._pubkey,
             to_pubkey=_ASTRALANE_TIP,
-            lamports=config.SENDER_TIP_LAMPORTS + config.ASTRALANE_AMS_TIP_LAMPORTS,
-        ))
-        ix_tip_helius = transfer(TransferParams(
-            from_pubkey=self._pubkey,
-            to_pubkey=_HELIUS_SENDER_TIP,
-            lamports=config.HELIUS_SENDER_TIP_LAMPORTS,
+            lamports=effective_tip,
         ))
 
-        # ── AdvanceNonceAccount (prepended when durable nonce is configured) ────
-        # Nonce ix must be first; the nonce value is used as the message blockhash.
         instructions = []
         if config.NONCE_ACCOUNT:
             nonce_acct = Pubkey.from_string(config.NONCE_ACCOUNT)
             ix_advance = Instruction(
                 program_id=_SYSTEM_PROGRAM,
                 accounts=[
-                    AccountMeta(nonce_acct,   False, True),   # nonce account (writable)
-                    AccountMeta(_SYSVAR_RECENT_BLOCKHASHES, False, False),  # recent blockhashes sysvar
-                    AccountMeta(self._pubkey, True,  False),  # nonce authority (signer)
+                    AccountMeta(nonce_acct,   False, True),
+                    AccountMeta(_SYSVAR_RECENT_BLOCKHASHES, False, False),
+                    AccountMeta(self._pubkey, True,  False),
                 ],
-                data=bytes([4, 0, 0, 0]),  # SystemInstruction::AdvanceNonceAccount
+                data=bytes([4, 0, 0, 0]),
             )
             instructions.append(ix_advance)
 
-        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy,
-                             ix_tip_astralane, ix_tip_helius])
+        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip])
 
-        # ── Legacy message — no ALT, immune to index drift ────────────────────
         msg = Message.new_with_blockhash(
             instructions,
             self._pubkey,
@@ -908,19 +954,13 @@ class SolanaClient:
         _CONST14   = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         _PFEE_PROG = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 
-        # ── Remaining accounts ────────────────────────────────────────────────
-        # Verified from on-chain txs:
-        # byte[82]==0 (old): [14] bc_v2                                         — 15 accounts
-        # byte[82]==1 (new): [14] per-user pump acct (pump_const1) + [15] bc_v2 — 16 accounts
         _PUMP_CONST1_GLOBAL = Pubkey.from_string("63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5")
         bc_v2, _ = Pubkey.find_program_address(
             [b"bonding-curve-v2", bytes(mint)], _PUMP_OLD_PROG
         )
         if needs_bc_v2:
-            # Old layout: bc_v2 only
             remaining = [AccountMeta(bc_v2, False, True)]
         else:
-            # New layout: global const + bc_v2
             remaining = [
                 AccountMeta(_PUMP_CONST1_GLOBAL, False, True),
                 AccountMeta(bc_v2,               False, True),
@@ -931,8 +971,8 @@ class SolanaClient:
 
         sell_data = (
             _SELL_DISC
-            + struct.pack("<Q", raw_amount)  # tokens to sell
-            + struct.pack("<Q", 0)           # min_sol_output — accept any
+            + struct.pack("<Q", raw_amount)
+            + struct.pack("<Q", 0)
         )
 
         ix_sell = Instruction(
@@ -952,7 +992,7 @@ class SolanaClient:
                 AccountMeta(_PUMP_OLD_PROG,  False, False),  # [11] program self-ref
                 AccountMeta(_CONST14,        False, False),  # [12]
                 AccountMeta(_PFEE_PROG,      False, False),  # [13] pfee program
-                *remaining,                                  # [14] bc_v2 if old layout; [14]+[15] if cashback
+                *remaining,
             ],
             data=bytes(sell_data),
         )
@@ -983,25 +1023,24 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fetch blockhash (or nonce) and fresh on-chain reserves in parallel
+        # Fetch nonce and fresh on-chain reserves in parallel
         t_fetch_start = time.perf_counter()
-        bh_coro = self._fetch_nonce() if config.NONCE_ACCOUNT else self._fresh_blockhash()
+        if not config.NONCE_ACCOUNT:
+            raise RuntimeError("sendIdeal requires NONCE_ACCOUNT — set it in .env")
         blockhash, fresh_reserves = await asyncio.gather(
-            bh_coro,
+            self._fetch_nonce(),
             self._fetch_bc_reserves(token_accounts.bonding_curve),
         )
         t_fetch = time.perf_counter() - t_fetch_start
         log.debug("Fetch latency: %.3fs (nonce+reserves)", t_fetch)
 
-        # Always prefer fresh on-chain reserves — signal values may be stale
-        # or in wrong units if sourced from PumpPortal (UI units vs raw u64)
         if fresh_reserves:
             vsol_lamports, vtoken_raw = fresh_reserves
             log.debug("BUY using fresh reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
         elif vsol_lamports is None or not vtoken_raw:
             raise RuntimeError("missing reserves and fresh fetch failed — skipping")
 
-        tx_bytes = self._build_local_buy_tx(
+        build_kwargs = dict(
             mint_str      = mint_str,
             accounts      = token_accounts,
             sol_lamports  = sol_lamports,
@@ -1009,13 +1048,31 @@ class SolanaClient:
             vsol_lamports = vsol_lamports,
             blockhash     = blockhash,
         )
-        tx_b64 = base64.b64encode(tx_bytes).decode()
-        sig    = await self._send_fast(tx_b64, tx_bytes)
+
+        # Build Tx A (high fee, low tip)  and Tx B (low fee, high tip) using same nonce
+        tx_a = self._build_local_buy_tx(
+            **build_kwargs,
+            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
+            tip_lamports = config.IDEAL_LOW_TIP_LAMPORTS,
+        )
+        tx_b = self._build_local_buy_tx(
+            **build_kwargs,
+            cu_price     = config.IDEAL_LOW_FEE_CU_PRICE,
+            tip_lamports = config.IDEAL_HIGH_TIP_LAMPORTS,
+        )
+
+        log.info(
+            "BUY  sendIdeal  TxA(fee=%d µL/CU tip=%d) TxB(fee=%d µL/CU tip=%d)",
+            config.IDEAL_HIGH_FEE_CU_PRICE, config.IDEAL_LOW_TIP_LAMPORTS,
+            config.IDEAL_LOW_FEE_CU_PRICE,  config.IDEAL_HIGH_TIP_LAMPORTS,
+        )
+
+        sig = await self._send_via_ideal(tx_a, tx_b)
         t_total = time.perf_counter() - t0
-        log.info("BUY  submitted (local)  sig=%s  total_time=%.3fs", sig, t_total)
+        log.info("BUY  submitted (sendIdeal)  sig=%s  total_time=%.3fs", sig, t_total)
+
         # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
-        if config.NONCE_ACCOUNT:
-            self.invalidate_nonce()
+        self.invalidate_nonce()
         return sig
 
     async def _fetch_ata_balance(self, mint_str: str) -> int:
@@ -1051,7 +1108,6 @@ class SolanaClient:
         log.info("SELL %s  %d raw tokens", mint_str, raw_balance)
 
         if token_accounts is not None:
-            # Fetch cashback flag and blockhash in parallel
             blockhash, needs_bc_v2 = await asyncio.gather(
                 self._fresh_blockhash(),
                 self._fetch_cashback_flag(token_accounts.bonding_curve),
@@ -1082,7 +1138,6 @@ class SolanaClient:
         last_broadcast = time.time()
 
         while time.time() < deadline:
-            # Rebroadcast every 2s if we have the tx bytes
             if tx_b64 and (time.time() - last_broadcast) >= 2.0:
                 try:
                     await self._send_via_rpc(tx_b64)
@@ -1143,16 +1198,15 @@ class SolanaClient:
             pre  = meta.get("preBalances",  [])
             post = meta.get("postBalances", [])
             if pre and post:
-                delta = pre[0] - post[0]   # positive = SOL left wallet
+                delta = pre[0] - post[0]
                 return max(delta, 0) / config.LAMPORTS_PER_SOL
         except Exception as exc:
             log.debug("_get_sol_spent failed for %s: %s", sig[:16], exc)
-        return config.BUY_AMOUNT_SOL  # fallback to intended amount
+        return config.BUY_AMOUNT_SOL
 
     async def _get_sol_received(self, sig: str) -> int:
         """
-        Fetch the confirmed tx and return the lamport increase for our wallet
-        (postBalance - preBalance for account index 0, the payer/signer).
+        Fetch the confirmed tx and return the lamport increase for our wallet.
         Returns 0 on any error rather than crashing P&L accounting.
         """
         try:
@@ -1169,7 +1223,6 @@ class SolanaClient:
             post = meta.get("postBalances", [])
             if pre and post:
                 delta = post[0] - pre[0]
-                # Passive drift detector — check if pump_const1 global has rotated
                 _EXPECTED_CONST1 = "63EDqM8TH3kcQAkT3P5fVExUnSMPizEheZX6GmiiutN5"
                 try:
                     keys = tx["transaction"]["message"]["accountKeys"]
