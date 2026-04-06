@@ -24,15 +24,16 @@ HELIUS_SENDER_TIP_LAMPORTS:  int = int(os.getenv("HELIUS_SENDER_TIP_LAMPORTS",  
 MIN_BUY_BUFFER_LAMPORTS:     int = int(os.getenv("MIN_BUY_BUFFER_LAMPORTS",     "20000000")) # 0.02 SOL
 
 # RPC endpoints
-HELIUS_RPC_HTTP:    str = "https://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
-FALLBACK_RPC_HTTP:  str = os.getenv("FALLBACK_RPC_HTTP", "https://mainnet.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c")
-HELIUS_RPC_WS:      str = "wss://beta.helius-rpc.com/?api-key=f3c50534-dbfe-4018-a722-4bc22358ca9c"
+HELIUS_API_KEY:      str = os.environ["HELIUS_API_KEY"]
+HELIUS_RPC_HTTP:     str = f"https://beta.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+FALLBACK_RPC_HTTP:   str = os.getenv("FALLBACK_RPC_HTTP", "https://solana-mainnet.g.alchemy.com/v2/jpQYcpvnQ8XNbc0M6_-Vd")
+HELIUS_RPC_WS:       str = f"wss://beta.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 HELIUS_SENDER_URL:   str = os.getenv("HELIUS_SENDER_URL",   "http://ams-sender.helius-rpc.com/fast")
 HELIUS_SENDER_URL_2: str = os.getenv("HELIUS_SENDER_URL_2", "http://fra-sender.helius-rpc.com/fast")
-ASTRALANE_URL:         str = os.getenv("ASTRALANE_URL",     "https://fr.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
-ASTRALANE_AMS_URL:     str = os.getenv("ASTRALANE_AMS_URL", "http://ams.gateway.astralane.io/iris?api-key=unsucoeItm674yCddm7AIuBkJNgkGREOIum6cxnXhcrM13u27OA1JzTctHksCtng")
+ASTRALANE_API_KEY:   str = os.environ["ASTRALANE_API_KEY"]
+ASTRALANE_URL:       str = f"https://fr.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
+ASTRALANE_AMS_URL:   str = f"http://ams.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
 ASTRALANE_AMS_TIP_LAMPORTS: int = int(os.getenv("ASTRALANE_AMS_TIP_LAMPORTS", "20000"))  # 0.00002 SOL
-ASTRALANE_API_KEY:     str = os.getenv("ASTRALANE_API_KEY", "")
 
 # Durable nonce (optional) — set NONCE_ACCOUNT to enable pre-signed txs
 NONCE_ACCOUNT:     str = os.getenv("NONCE_ACCOUNT", "")

@@ -1,8 +1,8 @@
 """
-Tracks open positions and fires auto-sell on take profit or HOLD_TIME_SECONDS timeout.
+Tracks open positions and fires auto-sell on trailing stop loss or HOLD_TIME_SECONDS timeout.
 
 Exit logic:
-  - Take profit: sell when estimated current value >= sol_spent * (1 + TAKE_PROFIT_PCT/100)
+  - Trailing stop loss: sell when current value drops 5% below peak value reached
   - Hold timer:  sell after HOLD_TIME_SECONDS regardless of price
   - Whichever fires first wins; the other is cancelled.
 
@@ -52,16 +52,15 @@ class PositionManager:
         self._state.open_position(pos)
         self._state.log("buy", mint, symbol,
                         f"bought {config.BUY_AMOUNT_SOL} SOL  order={buy_order_id[:12]}…")
-        log.info("Position opened  %s  hold=%ds  tp=+%.0f%%",
-                 mint, config.HOLD_TIME_SECONDS, config.TAKE_PROFIT_PCT)
+        log.info("Position opened  %s  hold=%ds  trailing_stop=5%%",
+                 mint, config.HOLD_TIME_SECONDS)
 
-        # Event fired by price monitor to trigger early exit
-        tp_event = asyncio.Event()
+        # Event fired by trailing stop loss to trigger early exit
+        stop_event = asyncio.Event()
+        peak_value_holder = [config.BUY_AMOUNT_SOL]  # Track peak value reached
 
         # Register live price callback with monitor
         if self._monitor:
-            # We need the actual token balance from chain before we can evaluate P&L
-            # Fetch it once now, then track from live updates
             tokens_held_holder = [tokens_held]
 
             def _on_price_update(vsol: float, vtoken_raw: int):
@@ -71,20 +70,26 @@ class PositionManager:
                 if not held:
                     return
                 current_value = (held * vsol) / vtoken_raw
-                gain_pct = (current_value / config.BUY_AMOUNT_SOL - 1.0) * 100.0
-                if gain_pct >= config.TAKE_PROFIT_PCT:
-                    log.info("TAKE PROFIT  %s  gain=+%.1f%%  value=%.4f SOL",
-                             mint, gain_pct, current_value)
-                    tp_event.set()
+
+                # Update peak value
+                if current_value > peak_value_holder[0]:
+                    peak_value_holder[0] = current_value
+
+                # Trailing stop: sell if drawdown from peak exceeds 5%
+                drawdown_pct = (current_value / peak_value_holder[0] - 1.0) * 100.0
+                if drawdown_pct <= -5.0:
+                    log.info("TRAILING STOP  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%",
+                             mint, peak_value_holder[0], current_value, drawdown_pct)
+                    stop_event.set()
 
             self._monitor.register_position(mint, _on_price_update)
         else:
             tokens_held_holder = [tokens_held]
 
-        asyncio.create_task(self._auto_sell(pos, tp_event, tokens_held_holder))
+        asyncio.create_task(self._auto_sell(pos, stop_event, tokens_held_holder, peak_value_holder))
 
-    async def _auto_sell(self, pos: PositionState, tp_event: asyncio.Event,
-                         tokens_held_holder: list):
+    async def _auto_sell(self, pos: PositionState, stop_event: asyncio.Event,
+                         tokens_held_holder: list, peak_value_holder: list):
         # Fetch actual token balance from chain (needed for accurate P&L math)
         if not tokens_held_holder[0]:
             for _ in range(10):
@@ -96,8 +101,8 @@ class PositionManager:
 
         # Periodic price poll — Helius push only fires when someone trades,
         # but these tokens often go dead after our buy so we need to poll
-        async def _poll_tp():
-            while not pos.closed and not tp_event.is_set():
+        async def _poll_stop():
+            while not pos.closed and not stop_event.is_set():
                 await asyncio.sleep(5)
                 held = tokens_held_holder[0]
                 if not held or not pos.token_accounts:
@@ -113,22 +118,28 @@ class PositionManager:
                         continue
                     vsol = vsol_lamports / config.LAMPORTS_PER_SOL
                     current_value = (held * vsol) / vtoken_raw
-                    gain_pct = (current_value / config.BUY_AMOUNT_SOL - 1.0) * 100.0
-                    if gain_pct >= config.TAKE_PROFIT_PCT:
-                        log.info("TAKE PROFIT (poll)  %s  gain=+%.1f%%  value=%.4f SOL",
-                                 pos.mint, gain_pct, current_value)
-                        tp_event.set()
+
+                    # Update peak value
+                    if current_value > peak_value_holder[0]:
+                        peak_value_holder[0] = current_value
+
+                    # Trailing stop: sell if drawdown from peak exceeds 5%
+                    drawdown_pct = (current_value / peak_value_holder[0] - 1.0) * 100.0
+                    if drawdown_pct <= -5.0:
+                        log.info("TRAILING STOP (poll)  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%",
+                                 pos.mint, peak_value_holder[0], current_value, drawdown_pct)
+                        stop_event.set()
                 except Exception:
                     pass
 
-        poll_task = asyncio.create_task(_poll_tp())
+        poll_task = asyncio.create_task(_poll_stop())
 
-        # Race: take profit vs hold timer
+        # Race: trailing stop vs hold timer
         hold_task = asyncio.create_task(asyncio.sleep(config.HOLD_TIME_SECONDS))
-        tp_task   = asyncio.create_task(tp_event.wait())
+        stop_task = asyncio.create_task(stop_event.wait())
 
         done, pending = await asyncio.wait(
-            [hold_task, tp_task],
+            [hold_task, stop_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
         for t in pending:
@@ -140,7 +151,7 @@ class PositionManager:
                 self._monitor.unregister_position(pos.mint)
             return
 
-        reason = "take_profit" if tp_task in done else "hold_timer"
+        reason = "trailing_stop" if stop_task in done else "hold_timer"
         log.info("Selling %s  reason=%s", pos.mint, reason)
 
         if self._monitor:

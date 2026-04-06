@@ -98,6 +98,7 @@ class SolanaClient:
         self._nonce_lock             = None # asyncio.Lock, created in warmup
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
+        self._creator_vault_cache: dict[str, str] = {}  # mint -> creator_vault, permanent cache
         log.info("Wallet: %s", self._pubkey)
 
     async def close(self):
@@ -147,6 +148,27 @@ class SolanaClient:
         await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash(),
                              _prime_nonce(), self._fetch_pump_alt(), self.refresh_balance())
         asyncio.create_task(self._blockhash_refresher())
+
+    async def warmup_creator_vaults(self, pairs: list[tuple[str, str]]):
+        """
+        Pre-derive and cache creator_vault for known tokens at startup.
+        pairs = [(bonding_curve_str, mint_str), ...]
+
+        Called during warmup to avoid RPC scan cost during live buy signals.
+        """
+        tasks = [
+            self._derive_creator_vault(bc, mint)
+            for bc, mint in pairs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cached = 0
+        for (bc, mint), result in zip(pairs, results):
+            if isinstance(result, Exception):
+                log.warning("creator_vault warmup failed for %s: %s", mint[:8], result)
+            else:
+                cached += 1
+        if cached:
+            log.info("creator_vault cache warmed: %d tokens", cached)
 
     async def _fetch_pump_alt(self):
         """Fetch and parse the pump.fun Address Lookup Table once at startup."""
@@ -238,6 +260,54 @@ class SolanaClient:
                 if url != urls[-1]:
                     log.debug("_rpc failed on %s: %s — retrying on fallback", url.split("/")[2][:20], exc)
         raise last_exc
+
+    async def _derive_creator_vault(self, bonding_curve_str: str, mint_str: str) -> str:
+        """
+        Derive creator_vault by scanning BC bytes for a pubkey that produces a valid PDA.
+        Cached permanently per mint — creator_vault never changes after token creation.
+
+        Scans all 32-byte-aligned offsets after the 8-byte discriminator, derives the
+        PDA with seeds [b"creator-vault", candidate_pubkey], and verifies the vault
+        exists on-chain. Works for both old and new BC layouts without hardcoded offsets.
+        """
+        if mint_str in self._creator_vault_cache:
+            return self._creator_vault_cache[mint_str]
+
+        bc_info = await self._rpc({
+            "method": "getAccountInfo",
+            "params": [bonding_curve_str, {"encoding": "base64"}]
+        })
+        bc_val = (bc_info or {}).get("value") or {}
+        bc_data_b64 = (bc_val.get("data") or [None])[0]
+        if not bc_data_b64:
+            raise ValueError(f"BC account data not found for {mint_str[:8]}")
+
+        bc_bytes = base64.b64decode(bc_data_b64)
+
+        # Try all 32-byte-aligned offsets after discriminator
+        for offset in range(8, len(bc_bytes) - 31, 1):
+            try:
+                candidate = Pubkey.from_bytes(bc_bytes[offset:offset+32])
+                if candidate == Pubkey.default():
+                    continue
+                vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(candidate)], _PUMP_OLD_PROG
+                )
+                # Verify vault exists on-chain (non-null, even if zero balance)
+                vault_info = await self._rpc({
+                    "method": "getAccountInfo",
+                    "params": [str(vault), {"encoding": "base64"}]
+                })
+                if (vault_info or {}).get("value") is not None:
+                    vault_str = str(vault)
+                    self._creator_vault_cache[mint_str] = vault_str
+                    log.debug("creator_vault derived: %s for %s (offset %d)",
+                              vault_str[:8], mint_str[:8], offset)
+                    return vault_str
+            except Exception:
+                continue
+
+        raise ValueError(f"creator_vault not found for {mint_str[:8]}")
 
     async def _get_token_balance(self, mint_str: str) -> tuple[int, float]:
         """
@@ -351,6 +421,7 @@ class SolanaClient:
             timeout=aiohttp.ClientTimeout(total=2),
         ) as resp:
             data = await resp.json(content_type=None)
+        log.debug("Astralane response: %s", data)
         if "error" in data:
             raise RuntimeError(f"Astralane error: {data['error']}")
         result = data.get("result")
@@ -361,18 +432,22 @@ class SolanaClient:
     async def _send_fast(self, tx_b64: str, tx_bytes: bytes | None = None) -> str:
         """Race all available endpoints in parallel — first successful response wins.
 
-        When nonce is enabled, blasts to Astralane, Helius Sender, and Helius RPC.
-        Without nonce, races Astralane sender and Helius RPC.
+        When nonce is enabled, uses authenticated Astralane + Helius Sender + Helius RPC.
+        Without nonce, uses unauthenticated Astralane sender + Helius RPC.
         """
         tasks = [
-            asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_URL)),
-            asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_AMS_URL)),
             asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL)),
             asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL_2)),
             asyncio.create_task(self._send_via_rpc(tx_b64)),
         ]
+
+        # Nonce txs: use authenticated Astralane (requires Bearer token)
+        # Regular txs: use unauthenticated sender endpoints
         if tx_bytes is not None and config.NONCE_ACCOUNT:
             tasks.append(asyncio.create_task(self._send_via_astralane(tx_bytes)))
+        else:
+            tasks.append(asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_URL)))
+            tasks.append(asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_AMS_URL)))
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
@@ -399,12 +474,16 @@ class SolanaClient:
         return str(Hash.from_bytes(data[40:72]))
 
     async def _fetch_nonce(self) -> str:
-        """Return the cached nonce value. Falls back to on-chain fetch if cache is empty."""
-        if self._nonce:
+        """Return the cached nonce value. Falls back to on-chain fetch if cache is empty.
+
+        Uses a lock to prevent race conditions when multiple buy signals fire simultaneously.
+        """
+        async with self._nonce_lock:
+            if self._nonce:
+                return self._nonce
+            log.warning("Nonce cache empty — fetching from chain")
+            self._nonce = await self._fetch_nonce_from_chain()
             return self._nonce
-        log.warning("Nonce cache empty — fetching from chain")
-        self._nonce = await self._fetch_nonce_from_chain()
-        return self._nonce
 
     def invalidate_nonce(self):
         """Call after a buy tx is submitted — nonce is consumed, must be refreshed."""
@@ -526,12 +605,7 @@ class SolanaClient:
                 log.warning("prefetch: unexpected account count %d for %s",
                             len(static), mint_str[:8])
                 return None
-            # Fetch bonding curve account: verify ownership (6EF8) and derive
-            # creator_vault = PDA(["creator-vault", creator], 6EF8) from bc data.
-            # BondingCurve layout: [0:8] disc, [8:16] vToken, [16:24] vSol,
-            #   [24:32] realToken, [32:40] realSol, [40:48] totalSupply,
-            #   [48:49] complete (bool), [49:81] creator (Pubkey)
-            creator_vault_str = str(static[4])  # PumpPortal's vault — authoritative
+            # Verify BC ownership and derive creator_vault via brute-force scan
             try:
                 bc_info = await self._rpc({
                     "method": "getAccountInfo",
@@ -543,27 +617,13 @@ class SolanaClient:
                     log.debug("prefetch: bc owned by %s (not 6EF8) for %s — skipping",
                               owner[:8], mint_str[:8])
                     raise WrongProgramError(owner)
-                bc_data_b64 = (bc_val.get("data") or [None])[0]
-                if bc_data_b64:
-                    import base64 as _b64
-                    bc_bytes = _b64.b64decode(bc_data_b64)
-                    if len(bc_bytes) >= 81:
-                        creator = Pubkey.from_bytes(bc_bytes[49:81])
-                        if str(creator) != "11111111111111111111111111111111":
-                            vault, _ = Pubkey.find_program_address(
-                                [b"creator-vault", bytes(creator)], _PUMP_OLD_PROG
-                            )
-                            derived = str(vault)
-                            if derived != creator_vault_str:
-                                log.warning("prefetch: BC-derived vault %s != static[4] %s for %s — keeping static[4]",
-                                            derived[:8], creator_vault_str[:8], mint_str[:8])
-                            else:
-                                log.debug("prefetch: creator_vault confirmed %s for %s",
-                                          creator_vault_str[:8], mint_str[:8])
+                creator_vault_str = await self._derive_creator_vault(str(static[2]), mint_str)
             except WrongProgramError:
                 raise
             except Exception as exc:
-                log.debug("prefetch: bc check failed for %s: %s", mint_str[:8], exc)
+                log.warning("prefetch: creator_vault derivation failed for %s: %s — using static[4]",
+                            mint_str[:8], exc)
+                creator_vault_str = str(static[4])
 
             return TokenAccounts(
                 assoc_user          = str(static[1]),
@@ -915,6 +975,7 @@ class SolanaClient:
         vsol_lamports:  int | None             = None,
         vtoken_raw:     int | None             = None,
     ) -> str:
+        t0 = time.perf_counter()
         log.info("BUY  %s  %.4f SOL", mint_str, sol_amount)
 
         sol_lamports = int(sol_amount * config.LAMPORTS_PER_SOL)
@@ -923,11 +984,14 @@ class SolanaClient:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
         # Fetch blockhash (or nonce) and fresh on-chain reserves in parallel
+        t_fetch_start = time.perf_counter()
         bh_coro = self._fetch_nonce() if config.NONCE_ACCOUNT else self._fresh_blockhash()
         blockhash, fresh_reserves = await asyncio.gather(
             bh_coro,
             self._fetch_bc_reserves(token_accounts.bonding_curve),
         )
+        t_fetch = time.perf_counter() - t_fetch_start
+        log.debug("Fetch latency: %.3fs (nonce+reserves)", t_fetch)
 
         # Always prefer fresh on-chain reserves — signal values may be stale
         # or in wrong units if sourced from PumpPortal (UI units vs raw u64)
@@ -947,7 +1011,8 @@ class SolanaClient:
         )
         tx_b64 = base64.b64encode(tx_bytes).decode()
         sig    = await self._send_fast(tx_b64, tx_bytes)
-        log.info("BUY  submitted (local)  sig=%s", sig)
+        t_total = time.perf_counter() - t0
+        log.info("BUY  submitted (local)  sig=%s  total_time=%.3fs", sig, t_total)
         # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
         if config.NONCE_ACCOUNT:
             self.invalidate_nonce()
@@ -1012,7 +1077,7 @@ class SolanaClient:
         don't cause a timeout. For SELL transactions, also fetches the confirmed
         tx to read the wallet's SOL delta for P&L tracking.
         """
-        timeout_s      = 30 if label == "BUY" else 60
+        timeout_s      = 60 if label == "BUY" else 60
         deadline       = time.time() + timeout_s
         last_broadcast = time.time()
 
@@ -1029,7 +1094,7 @@ class SolanaClient:
             try:
                 result   = await self._rpc({
                     "method": "getSignatureStatuses",
-                    "params": [[sig], {"searchTransactionHistory": False}],
+                    "params": [[sig], {"searchTransactionHistory": True}],
                 }, timeout=3)
                 statuses = result.get("value", [None])
                 status   = statuses[0] if statuses else None

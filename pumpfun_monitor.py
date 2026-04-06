@@ -43,8 +43,9 @@ VSOL_INIT = 30.0
 VSOL_MAX  = 793.0
 
 # Thresholds
-PEAK_SOL = 1.0    # vSol must rise at least 1 SOL above init before we care
+PEAK_SOL = 1.5    # vSol must rise at least 1.5 SOL above init before we care
 ZERO_SOL = 0.01   # trigger when vSol is within 0.01 SOL of init
+MIN_TRADES = 3    # minimum number of buy transactions required
 
 # pump.fun program — used to derive bonding curve PDA
 _PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
@@ -68,7 +69,7 @@ class TokenWatch:
     __slots__ = ("mint", "symbol", "name", "created_at",
                  "vsol", "peak_vsol", "had_activity",
                  "vtoken_raw", "accounts",
-                 "last_dashboard_update")
+                 "last_dashboard_update", "vsol_timestamp", "trade_count")
 
     def __init__(self, mint: str, symbol: str, name: str, created_at: float):
         self.mint         = mint
@@ -81,6 +82,8 @@ class TokenWatch:
         self.vtoken_raw:  int | None           = None
         self.accounts:    TokenAccounts | None = None
         self.last_dashboard_update: float      = 0.0
+        self.vsol_timestamp: float             = 0.0
+        self.trade_count: int                  = 0
 
 
 class PumpFunMonitor:
@@ -170,6 +173,10 @@ class PumpFunMonitor:
         # Already fired / removed
         if mint not in self._watching:
             return
+
+        # Count trades when vsol increases
+        if vsol > watch.vsol:
+            watch.trade_count += 1
 
         watch.vsol = vsol
         if vsol > watch.peak_vsol:
