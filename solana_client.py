@@ -45,7 +45,6 @@ _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 
 # Tip recipients
 _ASTRALANE_TIP     = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
-_HELIUS_SENDER_TIP = Pubkey.from_string("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta")
 
 # Nonce account sysvar required by AdvanceNonceAccount instruction
 _SYSVAR_RECENT_BLOCKHASHES = Pubkey.from_string("SysvarRecentB1ockHashes11111111111111111111")
@@ -380,31 +379,6 @@ class SolanaClient:
             raise RuntimeError(f"Astralane unexpected response: {data}")
         return data["result"]
 
-    async def _send_via_helius_sender(self, tx_b64: str, url: str | None = None) -> str:
-        """Submit via Helius Sender /fast endpoint (staked connection)."""
-        async with self._session.post(
-            url or config.HELIUS_SENDER_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id":      1,
-                "method":  "sendTransaction",
-                "params":  [tx_b64, {
-                    "encoding":      "base64",
-                    "skipPreflight": True,
-                    "maxRetries":    0,
-                }],
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=2),
-        ) as resp:
-            data = await resp.json(content_type=None)
-        log.debug("Helius Sender response (status=%d): %s", resp.status, data)
-        if "error" in data:
-            raise RuntimeError(f"Helius Sender error: {data['error']}")
-        if "result" not in data:
-            raise RuntimeError(f"Helius Sender unexpected response: {data}")
-        return data["result"]
-
     async def _send_via_astralane(self, tx_bytes: bytes) -> str:
         """Submit raw tx bytes to Astralane with Bearer auth (used for nonce txs)."""
         encoded = base64.b64encode(tx_bytes).decode()
@@ -483,38 +457,6 @@ class SolanaClient:
             if "error" in data:
                 raise RuntimeError(f"sendIdeal error: {data['error']}")
         raise RuntimeError(f"sendIdeal unexpected response: {data}")
-
-    async def _send_fast(self, tx_b64: str, tx_bytes: bytes | None = None) -> str:
-        """Race all available endpoints in parallel — first successful response wins.
-
-        Kept as fallback for sell transactions and PumpPortal-path buys.
-        For local buys with nonce, use _send_via_ideal() instead.
-        When nonce is enabled, uses authenticated Astralane + Helius Sender + Helius RPC.
-        Without nonce, uses unauthenticated Astralane sender + Helius RPC.
-        """
-        tasks = [
-            asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL)),
-            asyncio.create_task(self._send_via_helius_sender(tx_b64, config.HELIUS_SENDER_URL_2)),
-            asyncio.create_task(self._send_via_rpc(tx_b64)),
-        ]
-
-        # Nonce txs: use authenticated Astralane (requires Bearer token)
-        # Regular txs: use unauthenticated sender endpoints
-        if tx_bytes is not None and config.NONCE_ACCOUNT:
-            tasks.append(asyncio.create_task(self._send_via_astralane(tx_bytes)))
-        else:
-            tasks.append(asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_URL)))
-            tasks.append(asyncio.create_task(self._send_via_sender(tx_b64, config.ASTRALANE_AMS_URL)))
-
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
-        # Return first SUCCESS — if first completion was an exception, try others
-        for t in done:
-            if not t.exception():
-                return t.result()
-        # All completed tasks failed — re-raise the first exception
-        raise done.pop().exception()
 
     async def _fetch_nonce_from_chain(self) -> str:
         """Read the durable nonce value directly from the nonce account on-chain."""
@@ -1181,6 +1123,19 @@ class SolanaClient:
             except Exception as exc:
                 log.debug("Status poll error: %s", exc)
             await asyncio.sleep(0.25)
+        # Diagnostic: check if tx actually landed but polling missed it
+        try:
+            tx_check = await self._rpc({
+                "method": "getTransaction",
+                "params": [sig, {"encoding": "json", "commitment": "confirmed",
+                                 "maxSupportedTransactionVersion": 0}],
+            }, timeout=5)
+            if tx_check and tx_check.get("value"):
+                log.error("TIMEOUT but tx found on-chain: sig=%s", sig[:16])
+            else:
+                log.error("TIMEOUT — tx %s never landed (not found on-chain)", sig[:16])
+        except Exception:
+            log.error("TIMEOUT — tx %s never landed (not found on-chain)", sig[:16])
         raise RuntimeError(f"TX {sig[:16]} {label} timed out after {timeout_s}s")
 
     async def _get_sol_spent(self, sig: str) -> float:
