@@ -77,7 +77,7 @@ class PositionManager:
 
                 # Trailing stop: sell if drawdown from peak exceeds 5%
                 drawdown_pct = (current_value / peak_value_holder[0] - 1.0) * 100.0
-                if drawdown_pct <= -5.0:
+                if drawdown_pct <= -config.TRAIL_STOP_PCT:
                     log.info("TRAILING STOP  %s  peak=%.4f  now=%.4f  drawdown=%.1f%%",
                              mint, peak_value_holder[0], current_value, drawdown_pct)
                     stop_event.set()

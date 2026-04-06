@@ -104,7 +104,7 @@ class PumpSnipeBot:
         log.info("  wallet        : %s", config.WALLET_ADDRESS)
         log.info("  buy amount    : %.3f SOL", config.BUY_AMOUNT_SOL)
         log.info("  hold time     : %ds", config.HOLD_TIME_SECONDS)
-        log.info("  take profit   : +%.0f%%", config.TAKE_PROFIT_PCT)
+        log.info("  trail stop    : -%.0f%% from peak", config.TRAIL_STOP_PCT)
         log.info("  max token age : %ds", config.MAX_TOKEN_AGE_SECONDS)
         log.info("  trigger       : 0.0%% bonding curve (everyone sold out)")
         log.info("  slippage      : %.0f%%", config.SLIPPAGE * 100)
