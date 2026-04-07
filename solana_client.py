@@ -870,48 +870,27 @@ class SolanaClient:
             blockhash     = blockhash,
         )
 
-        # Build Tx A (high fee, low tip)  and Tx B (low fee, high tip) using same nonce
-        tx_a = self._build_local_buy_tx(
+        # Build single tx with high priority fee (TxA path - most effective)
+        tx = self._build_local_buy_tx(
             **build_kwargs,
             cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
             tip_lamports = config.IDEAL_LOW_TIP_LAMPORTS,
         )
-        tx_b = self._build_local_buy_tx(
-            **build_kwargs,
-            cu_price     = config.IDEAL_LOW_FEE_CU_PRICE,
-            tip_lamports = config.IDEAL_HIGH_TIP_LAMPORTS,
-        )
 
         log.info(
-            "BUY  dual-path iris  TxA(fee=%d µL/CU tip=%d) TxB(fee=%d µL/CU tip=%d)",
+            "BUY  single-path iris  fee=%d µL/CU tip=%d",
             config.IDEAL_HIGH_FEE_CU_PRICE, config.IDEAL_LOW_TIP_LAMPORTS,
-            config.IDEAL_LOW_FEE_CU_PRICE,  config.IDEAL_HIGH_TIP_LAMPORTS,
         )
 
-        # Submit both tx variants via /iris in parallel — first accepted sig wins
-        results = await asyncio.gather(
-            self._send_via_astralane(tx_a),
-            self._send_via_astralane(tx_b),
-            return_exceptions=True,
-        )
-        sigs = []
-        for i, r in enumerate(results):
-            label = "TxA" if i == 0 else "TxB"
-            if isinstance(r, Exception):
-                log.warning("BUY  %s failed: %s", label, r)
-            else:
-                log.info("BUY  %s accepted: %s", label, r)
-                sigs.append(r)
-        if not sigs:
-            raise RuntimeError(f"Both tx paths failed: A={results[0]}, B={results[1]}")
+        # Submit via /iris
+        sig = await self._send_via_astralane(tx)
         t_total = time.perf_counter() - t0
-        log.info("BUY  submitted (dual-path iris)  sigs=%s  total_time=%.3fs",
-                 [s[:16] for s in sigs], t_total)
+        log.info("BUY  submitted (single-path iris)  sig=%s  total_time=%.3fs",
+                 sig[:16], t_total)
 
         # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
         self.invalidate_nonce()
-        # Return first sig as primary, attach all sigs for multi-sig polling
-        return sigs[0] + "|" + ",".join(sigs)
+        return sig
 
     async def _fetch_ata_balance(self, mint_str: str) -> int:
         """Fetch raw token balance directly from the seed-derived ATA we created.
