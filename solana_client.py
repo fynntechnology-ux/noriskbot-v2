@@ -978,7 +978,7 @@ class SolanaClient:
             primary = sig
             all_sigs = [sig]
 
-        timeout_s      = 15 if label == "BUY" else 15
+        timeout_s      = 30 if label == "BUY" else 30
         deadline       = time.time() + timeout_s
         last_broadcast = time.time()
 
@@ -1015,9 +1015,15 @@ class SolanaClient:
                                 log.info("SELL confirmed | sig=%s layout=%s accounts=%d",
                                          found_sig[:16], "old" if needs_bc_v2 else "new",
                                          15 if needs_bc_v2 else 16)
-                            output_amount = await self._get_sol_received(found_sig)
+                            try:
+                                output_amount = await self._get_sol_received(found_sig)
+                            except Exception as e:
+                                log.warning("Failed to fetch sol_received for %s: %s", found_sig[:16], e)
                         elif label == "BUY":
-                            sol_spent = await self._get_sol_spent(found_sig)
+                            try:
+                                sol_spent = await self._get_sol_spent(found_sig)
+                            except Exception as e:
+                                log.warning("Failed to fetch sol_spent for %s: %s", found_sig[:16], e)
                         return {"sig": found_sig, "status": conf, "output_amount": output_amount, "sol_spent": sol_spent}
             except RuntimeError as exc:
                 if "-32429" in str(exc):
