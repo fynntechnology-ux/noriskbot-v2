@@ -98,6 +98,8 @@ class SolanaClient:
         self._blockhash_ts           = 0.0
         self._nonce                  = ""   # cached nonce value
         self._nonce_lock             = None # asyncio.Lock, created in warmup
+        self._nonce_refresh_task     = None # background refill task
+        self._last_consumed_nonce    = ""   # track to detect reuse
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
         log.info("Wallet: %s", self._pubkey)
@@ -207,14 +209,6 @@ class SolanaClient:
         return bh
 
     # ── RPC ──────────────────────────────────────────────────────────────────
-
-    async def _refresh_nonce(self):
-        """Background task: fetch fresh nonce after it's been consumed by a buy."""
-        try:
-            self._nonce = await self._fetch_nonce_from_chain()
-            log.debug("Nonce refreshed: %s…", self._nonce[:12])
-        except Exception as exc:
-            log.warning("Nonce refresh failed: %s", exc)
 
     async def _rpc(self, body: dict, timeout: float = 5.0) -> dict:
         body.setdefault("jsonrpc", "2.0")
@@ -350,22 +344,52 @@ class SolanaClient:
             raise RuntimeError(f"Nonce account data too short: {len(data)} bytes")
         return str(Hash.from_bytes(data[40:72]))
 
-    async def _fetch_nonce(self) -> str:
-        """Return the cached nonce value. Falls back to on-chain fetch if cache is empty.
+    async def _acquire_nonce(self) -> str:
+        """Atomically acquire a nonce for exactly one transaction.
 
-        Uses a lock to prevent race conditions when multiple buy signals fire simultaneously.
+        Guarantees the same nonce is never handed out twice:
+          1. If a background replenish is running, wait for it
+          2. If cache is still empty, wait 300ms then fetch from chain
+             (the delay lets the previous tx land and advance the nonce)
+          3. Return the nonce and clear the cache under the same lock
         """
         async with self._nonce_lock:
-            if self._nonce:
-                return self._nonce
-            log.warning("Nonce cache empty — fetching from chain")
-            self._nonce = await self._fetch_nonce_from_chain()
-            return self._nonce
+            # If replenish task is still running from a previous buy, wait for it
+            if self._nonce_refresh_task and not self._nonce_refresh_task.done():
+                await self._nonce_refresh_task
+            if not self._nonce:
+                # Previous tx may not have landed yet — wait for nonce to advance
+                await asyncio.sleep(0.3)
+                self._nonce = await self._fetch_nonce_from_chain()
+            nonce = self._nonce
+            self._last_consumed_nonce = nonce
+            self._nonce = ""
+            return nonce
 
-    def invalidate_nonce(self):
-        """Call after a buy tx is submitted — nonce is consumed, must be refreshed."""
-        self._nonce = ""
-        asyncio.create_task(self._refresh_nonce())
+    async def _replenish_nonce(self):
+        """Fetch a fresh nonce from chain after a short delay.
+        If the fetched nonce matches the last consumed one, retry once."""
+        try:
+            await asyncio.sleep(0.2)
+            fresh = await self._fetch_nonce_from_chain()
+            if fresh == self._last_consumed_nonce:
+                log.debug("Nonce stale (same as consumed) — retrying after 0.5s")
+                await asyncio.sleep(0.5)
+                fresh = await self._fetch_nonce_from_chain()
+            async with self._nonce_lock:
+                if not self._nonce:
+                    self._nonce = fresh
+                    log.debug("Nonce replenished: %s…", self._nonce[:12])
+        except Exception as exc:
+            log.warning("Nonce replenish failed: %s", exc)
+        finally:
+            self._nonce_refresh_task = None
+
+    def _ensure_nonce_replenish(self):
+        """Start a single background nonce refill task if none is running."""
+        if self._nonce_refresh_task and not self._nonce_refresh_task.done():
+            return
+        self._nonce_refresh_task = asyncio.create_task(self._replenish_nonce())
 
     async def create_nonce_account(self) -> str:
         """One-time utility: create and fund a durable nonce account (0.0015 SOL).
@@ -872,12 +896,12 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fetch nonce, fresh on-chain reserves, and fresh creator vault in parallel
+        # Fetch nonce (atomic — consumed immediately), fresh reserves, creator vault
         t_fetch_start = time.perf_counter()
         if not config.NONCE_ACCOUNT:
-            raise RuntimeError("dual-path buy requires NONCE_ACCOUNT — set it in .env")
+            raise RuntimeError("buy requires NONCE_ACCOUNT — set it in .env")
         blockhash, fresh_reserves, fresh_vault = await asyncio.gather(
-            self._fetch_nonce(),
+            self._acquire_nonce(),
             self._fetch_bc_reserves(token_accounts.bonding_curve),
             self._fetch_fresh_creator_vault(mint_str),
         )
@@ -929,9 +953,11 @@ class SolanaClient:
         t_total = time.perf_counter() - t0
         log.info("BUY  submitted (single-path iris)  sig=%s  total_time=%.3fs",
                  sig[:16], t_total)
+        log.info("BUY  nonce_at_submit=%s", blockhash[:16])
 
-        # Nonce is consumed the moment the tx lands — pre-fetch the next one immediately
-        self.invalidate_nonce()
+        # This nonce was already atomically consumed by _acquire_nonce().
+        # Start background refill for the next buy, but never allow reuse.
+        self._ensure_nonce_replenish()
         return sig
 
     async def _fetch_ata_balance(self, mint_str: str) -> int:
