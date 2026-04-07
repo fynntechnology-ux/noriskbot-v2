@@ -967,10 +967,25 @@ class SolanaClient:
         log.info("SELL %s  %d raw tokens", mint_str, raw_balance)
 
         if token_accounts is not None:
-            blockhash, needs_bc_v2 = await asyncio.gather(
+            blockhash, needs_bc_v2, fresh_vault = await asyncio.gather(
                 self._fresh_blockhash(),
                 self._fetch_cashback_flag(token_accounts.bonding_curve),
+                self._fetch_fresh_creator_vault(mint_str),
             )
+
+            # Apply fresh creator vault to eliminate drift
+            if fresh_vault:
+                token_accounts = TokenAccounts(
+                    assoc_user          = token_accounts.assoc_user,
+                    bonding_curve       = token_accounts.bonding_curve,
+                    assoc_bonding_curve = token_accounts.assoc_bonding_curve,
+                    creator_vault       = fresh_vault,
+                    pump_const1         = token_accounts.pump_const1,
+                    unk16               = token_accounts.unk16,
+                )
+            else:
+                log.warning("SELL %s using cached creator_vault — drift risk", mint_str[:8])
+
             log.debug("SELL %s  layout=%s accounts=%d",
                       mint_str[:8], "old" if needs_bc_v2 else "new",
                       15 if needs_bc_v2 else 16)
