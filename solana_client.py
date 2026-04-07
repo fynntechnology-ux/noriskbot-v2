@@ -443,6 +443,7 @@ class SolanaClient:
         """
         POST to PumpPortal local trade API.
         Returns raw unsigned transaction bytes.
+        Hard-capped at 2.5s total to prevent hangs.
         """
         async with self._session.post(
             PUMPPORTAL_TRADE_URL,
@@ -465,7 +466,8 @@ class SolanaClient:
         return bytes(VersionedTransaction.populate(msg, [sig]))
 
     async def _fetch_fresh_creator_vault(self, mint_str: str) -> str | None:
-        """Re-fetch creator_vault (static[4]) from PumpPortal at buy time."""
+        """Re-fetch creator_vault (static[4]) from PumpPortal at buy time.
+        Hard-capped at 3s to prevent blocking the buy pipeline."""
         priority_fee_sol = (
             config.COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
         )
@@ -480,7 +482,7 @@ class SolanaClient:
             "pool":             "pump",
         }
         try:
-            tx_bytes = await self._get_pump_tx(payload)
+            tx_bytes = await asyncio.wait_for(self._get_pump_tx(payload), timeout=3.0)
             tx       = VersionedTransaction.from_bytes(tx_bytes)
             static   = tx.message.account_keys
             if len(static) < 5:
@@ -488,6 +490,9 @@ class SolanaClient:
             vault = str(static[4])
             log.debug("Fresh creator_vault for %s: %s", mint_str[:8], vault[:12])
             return vault
+        except asyncio.TimeoutError:
+            log.warning("_fetch_fresh_creator_vault TIMEOUT for %s after 3s", mint_str[:8])
+            return None
         except Exception as exc:
             log.warning("_fetch_fresh_creator_vault failed for %s: %s", mint_str[:8], exc)
             return None

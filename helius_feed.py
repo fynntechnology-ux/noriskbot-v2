@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import struct
+import time
 from typing import Callable
 
 import websockets
@@ -61,6 +62,7 @@ class HeliusAccountFeed:
         self._mint_to_sub:  dict[str, int] = {}
         # In-flight subscribe requests: req_id → mint
         self._pending_reqs: dict[int, str] = {}
+        self._last_msg      = time.time()  # watchdog: last message time
 
     def _next_id(self) -> int:
         rid = self._req_id
@@ -113,7 +115,23 @@ class HeliusAccountFeed:
 
     # ------------------------------------------------------------------
 
+    async def _watchdog(self):
+        """Force reconnection if no messages for 30s."""
+        while True:
+            await asyncio.sleep(10)
+            if self._ws is None:
+                continue
+            elapsed = time.time() - self._last_msg
+            if elapsed > 30:
+                log.warning("Helius silent for %.0fs — forcing reconnect", elapsed)
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+
     async def run(self):
+        asyncio.create_task(self._watchdog())
         log.info("Connecting to Helius Gatekeeper…")
         while True:
             try:
@@ -135,6 +153,7 @@ class HeliusAccountFeed:
                         await self._send_subscribe(mint, bc)
 
                     async for raw in ws:
+                        self._last_msg = time.time()
                         try:
                             msg = json.loads(raw)
                         except Exception:

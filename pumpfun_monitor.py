@@ -99,6 +99,7 @@ class PumpFunMonitor:
         self._ws             = None
         self._pending_unsubs: set[str]        = set()
         self._helius         = HeliusAccountFeed(on_update=self._on_helius_update)
+        self._last_pp_msg    = time.time()  # watchdog: last PumpPortal message time
 
     def register_position(self, mint: str, callback: Callable[[float, int], None]):
         """Called by PositionManager after a buy — keeps Helius feed alive for price tracking."""
@@ -264,9 +265,25 @@ class PumpFunMonitor:
     # WebSocket stream (PumpPortal — new token discovery)
     # ------------------------------------------------------------------
 
+    async def _pp_watchdog(self):
+        """Force PumpPortal reconnection if no messages for 30s."""
+        while True:
+            await asyncio.sleep(10)
+            if self._ws is None:
+                continue
+            elapsed = time.time() - self._last_pp_msg
+            if elapsed > 30:
+                log.warning("PumpPortal silent for %.0fs — forcing reconnect", elapsed)
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+
     async def run(self):
         asyncio.create_task(self._reaper())
         asyncio.create_task(self._helius.run())
+        asyncio.create_task(self._pp_watchdog())
         log.info("Connecting to PumpPortal WebSocket…")
 
         while True:
@@ -287,6 +304,7 @@ class PumpFunMonitor:
                         self._pending_unsubs.clear()
 
                     async for raw in ws:
+                        self._last_pp_msg = time.time()
                         try:
                             msg = json.loads(raw)
                         except json.JSONDecodeError:
