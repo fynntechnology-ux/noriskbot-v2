@@ -348,18 +348,18 @@ class SolanaClient:
         """Atomically acquire a nonce for exactly one transaction.
 
         Guarantees the same nonce is never handed out twice:
-          1. If a background replenish is running, wait for it
-          2. If cache is still empty, wait 300ms then fetch from chain
-             (the delay lets the previous tx land and advance the nonce)
+          1. If a background replenish is running, wait up to 2s for it
+          2. If cache is still empty, fetch from chain
           3. Return the nonce and clear the cache under the same lock
         """
         async with self._nonce_lock:
-            # If replenish task is still running from a previous buy, wait for it
+            # If replenish task is still running, wait briefly for it
             if self._nonce_refresh_task and not self._nonce_refresh_task.done():
-                await self._nonce_refresh_task
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._nonce_refresh_task), timeout=2.0)
+                except asyncio.TimeoutError:
+                    log.warning("Nonce replenish taking >2s — fetching fresh instead")
             if not self._nonce:
-                # Previous tx may not have landed yet — wait for nonce to advance
-                await asyncio.sleep(0.3)
                 self._nonce = await self._fetch_nonce_from_chain()
             nonce = self._nonce
             self._last_consumed_nonce = nonce
@@ -367,19 +367,19 @@ class SolanaClient:
             return nonce
 
     async def _replenish_nonce(self):
-        """Fetch a fresh nonce from chain after a short delay.
-        If the fetched nonce matches the last consumed one, retry once."""
+        """Fetch a fresh nonce from chain. Hard-capped at 3s."""
         try:
-            await asyncio.sleep(0.2)
-            fresh = await self._fetch_nonce_from_chain()
+            fresh = await asyncio.wait_for(self._fetch_nonce_from_chain(), timeout=3.0)
             if fresh == self._last_consumed_nonce:
                 log.debug("Nonce stale (same as consumed) — retrying after 0.5s")
                 await asyncio.sleep(0.5)
-                fresh = await self._fetch_nonce_from_chain()
+                fresh = await asyncio.wait_for(self._fetch_nonce_from_chain(), timeout=3.0)
             async with self._nonce_lock:
                 if not self._nonce:
                     self._nonce = fresh
                     log.debug("Nonce replenished: %s…", self._nonce[:12])
+        except asyncio.TimeoutError:
+            log.warning("Nonce replenish timed out after 3s")
         except Exception as exc:
             log.warning("Nonce replenish failed: %s", exc)
         finally:
@@ -905,11 +905,17 @@ class SolanaClient:
         t_fetch_start = time.perf_counter()
         if not config.NONCE_ACCOUNT:
             raise RuntimeError("buy requires NONCE_ACCOUNT — set it in .env")
-        blockhash, fresh_reserves, fresh_vault = await asyncio.gather(
-            self._acquire_nonce(),
-            self._fetch_bc_reserves(token_accounts.bonding_curve),
-            self._fetch_fresh_creator_vault(mint_str),
-        )
+        try:
+            blockhash, fresh_reserves, fresh_vault = await asyncio.wait_for(
+                asyncio.gather(
+                    self._acquire_nonce(),
+                    self._fetch_bc_reserves(token_accounts.bonding_curve),
+                    self._fetch_fresh_creator_vault(mint_str),
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError("buy fetch timed out after 5s — skipping")
         t_fetch = time.perf_counter() - t_fetch_start
         log.debug("Fetch latency: %.3fs (nonce+reserves+vault)", t_fetch)
 
