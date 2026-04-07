@@ -440,6 +440,34 @@ class SolanaClient:
         sig = self._keypair.sign_message(bytes([0x80]) + bytes(msg))
         return bytes(VersionedTransaction.populate(msg, [sig]))
 
+    async def _fetch_fresh_creator_vault(self, mint_str: str) -> str | None:
+        """Re-fetch creator_vault (static[4]) from PumpPortal at buy time."""
+        priority_fee_sol = (
+            config.COMPUTE_UNIT_PRICE * config.COMPUTE_UNIT_LIMIT / 1_000_000 / 1_000_000_000
+        )
+        payload = {
+            "publicKey":        str(self._pubkey),
+            "action":           "buy",
+            "mint":             mint_str,
+            "amount":           config.BUY_AMOUNT_SOL,
+            "denominatedInSol": "true",
+            "slippage":         int(config.SLIPPAGE * 100),
+            "priorityFee":      priority_fee_sol,
+            "pool":             "pump",
+        }
+        try:
+            tx_bytes = await self._get_pump_tx(payload)
+            tx       = VersionedTransaction.from_bytes(tx_bytes)
+            static   = tx.message.account_keys
+            if len(static) < 5:
+                return None
+            vault = str(static[4])
+            log.debug("Fresh creator_vault for %s: %s", mint_str[:8], vault[:12])
+            return vault
+        except Exception as exc:
+            log.warning("_fetch_fresh_creator_vault failed for %s: %s", mint_str[:8], exc)
+            return None
+
     # ── Local transaction building ─────────────────────────────────────────────
 
     async def prefetch_token_accounts(self, mint_str: str, **_kw) -> TokenAccounts | None:
@@ -844,22 +872,36 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fetch nonce and fresh on-chain reserves in parallel
+        # Fetch nonce, fresh on-chain reserves, and fresh creator vault in parallel
         t_fetch_start = time.perf_counter()
         if not config.NONCE_ACCOUNT:
             raise RuntimeError("dual-path buy requires NONCE_ACCOUNT — set it in .env")
-        blockhash, fresh_reserves = await asyncio.gather(
+        blockhash, fresh_reserves, fresh_vault = await asyncio.gather(
             self._fetch_nonce(),
             self._fetch_bc_reserves(token_accounts.bonding_curve),
+            self._fetch_fresh_creator_vault(mint_str),
         )
         t_fetch = time.perf_counter() - t_fetch_start
-        log.debug("Fetch latency: %.3fs (nonce+reserves)", t_fetch)
+        log.debug("Fetch latency: %.3fs (nonce+reserves+vault)", t_fetch)
 
         if fresh_reserves:
             vsol_lamports, vtoken_raw = fresh_reserves
             log.debug("BUY using fresh reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
         elif vsol_lamports is None or not vtoken_raw:
             raise RuntimeError("missing reserves and fresh fetch failed — skipping")
+
+        # Apply fresh creator vault to eliminate drift
+        if fresh_vault:
+            token_accounts = TokenAccounts(
+                assoc_user          = token_accounts.assoc_user,
+                bonding_curve       = token_accounts.bonding_curve,
+                assoc_bonding_curve = token_accounts.assoc_bonding_curve,
+                creator_vault       = fresh_vault,
+                pump_const1         = token_accounts.pump_const1,
+                unk16               = token_accounts.unk16,
+            )
+        else:
+            log.warning("BUY %s using cached creator_vault — drift risk", mint_str[:8])
 
         build_kwargs = dict(
             mint_str      = mint_str,
