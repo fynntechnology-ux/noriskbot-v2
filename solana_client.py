@@ -45,6 +45,7 @@ _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 
 # Tip recipients
 _ASTRALANE_TIP     = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
+_HELIUS_FAST_TIP   = Pubkey.from_string("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta")
 
 # Nonce account sysvar required by AdvanceNonceAccount instruction
 _SYSVAR_RECENT_BLOCKHASHES = Pubkey.from_string("SysvarRecentB1ockHashes11111111111111111111")
@@ -343,6 +344,39 @@ class SolanaClient:
         if len(data) < 80:
             raise RuntimeError(f"Nonce account data too short: {len(data)} bytes")
         return str(Hash.from_bytes(data[40:72]))
+
+    async def _derive_creator_vault(self, mint_str: str, bc_addr: str) -> str | None:
+        """Derive creator_vault PDA directly from bonding curve data (no PumpPortal round-trip).
+        Uses GetBlock endpoint to spread load off Helius."""
+        try:
+            async with self._session.post(
+                "https://go.getblock.io/8c82122595b643aab1fdfc6de55060d6",
+                json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getAccountInfo",
+                    "params": [bc_addr, {"encoding": "base64", "commitment": "processed"}],
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as resp:
+                data = await resp.json(content_type=None)
+            data_b64 = ((data or {}).get("result") or {}).get("value", {}).get("data", [None])[0]
+            if not data_b64:
+                return None
+            data = base64.b64decode(data_b64)
+            if len(data) < 81:
+                return None
+            creator = Pubkey.from_bytes(data[49:81])
+            if str(creator) == "11111111111111111111111111111111":
+                return None
+            vault, _ = Pubkey.find_program_address(
+                [b"creator-vault", bytes(creator)],
+                _PUMP_OLD_PROG,
+            )
+            return str(vault)
+        except Exception as exc:
+            log.warning("_derive_creator_vault failed for %s: %s", mint_str[:8], exc)
+            return None
 
     async def _acquire_nonce(self) -> str:
         """Atomically acquire a nonce for exactly one transaction.
@@ -673,6 +707,7 @@ class SolanaClient:
         blockhash:     str,
         cu_price:      int | None = None,
         tip_lamports:  int | None = None,
+        tip_recipient: Pubkey | None = None,
     ) -> bytes:
         """
         Build and sign a pump.fun buy transaction locally using Legacy format.
@@ -697,6 +732,7 @@ class SolanaClient:
 
         effective_cu_price   = cu_price      if cu_price      is not None else config.COMPUTE_UNIT_PRICE
         effective_tip        = tip_lamports  if tip_lamports  is not None else config.SENDER_TIP_LAMPORTS
+        effective_tip_recip  = tip_recipient if tip_recipient is not None else _ASTRALANE_TIP
 
         mint        = Pubkey.from_string(mint_str)
         token_seed  = mint_str[:8]
@@ -773,7 +809,7 @@ class SolanaClient:
         # Single Astralane tip — amount varies by variant (low for Tx A, high for Tx B)
         ix_tip = transfer(TransferParams(
             from_pubkey=self._pubkey,
-            to_pubkey=_ASTRALANE_TIP,
+            to_pubkey=effective_tip_recip,
             lamports=effective_tip,
         ))
 
@@ -910,7 +946,7 @@ class SolanaClient:
                 asyncio.gather(
                     self._acquire_nonce(),
                     self._fetch_bc_reserves(token_accounts.bonding_curve),
-                    self._fetch_fresh_creator_vault(mint_str),
+                    self._derive_creator_vault(mint_str, token_accounts.bonding_curve),
                 ),
                 timeout=5.0,
             )
@@ -947,23 +983,87 @@ class SolanaClient:
             blockhash     = blockhash,
         )
 
-        # Build single tx with high priority fee (TxA path - most effective)
-        tx = self._build_local_buy_tx(
+        # Build Astralane tx (standard tip)
+        tx_astralane = self._build_local_buy_tx(
             **build_kwargs,
             cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
-            tip_lamports = config.IDEAL_LOW_TIP_LAMPORTS,
+            tip_lamports = config.SENDER_TIP_LAMPORTS,
         )
+
+        # Build Helius fast tx (higher tip to different recipient)
+        tx_helius = self._build_local_buy_tx(
+            **build_kwargs,
+            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
+            tip_lamports = 300000,  # 0.0003 SOL
+            tip_recipient = _HELIUS_FAST_TIP,
+        )
+        tx_helius_b64 = base64.b64encode(tx_helius).decode()
 
         log.info(
-            "BUY  single-path iris  fee=%d µL/CU tip=%d",
-            config.IDEAL_HIGH_FEE_CU_PRICE, config.IDEAL_LOW_TIP_LAMPORTS,
+            "BUY  tri-path  AMS(tip=%d) helius_FR(tip=300000) helius_AMS(tip=300000)",
+            config.SENDER_TIP_LAMPORTS,
         )
 
-        # Submit via /iris
-        sig = await self._send_via_astralane(tx)
-        t_total = time.perf_counter() - t0
-        log.info("BUY  submitted (single-path iris)  sig=%s  total_time=%.3fs",
-                 sig[:16], t_total)
+        # Submit to all gateways in parallel
+        ams_result, helius_fr_result, helius_ams_result = await asyncio.gather(
+            self._send_via_sender(base64.b64encode(tx_astralane).decode(), config.ASTRALANE_AMS_URL),
+            self._send_via_sender(tx_helius_b64, "http://fra-sender.helius-rpc.com/fast"),
+            self._send_via_sender(tx_helius_b64, "http://ams-sender.helius-rpc.com/fast"),
+            return_exceptions=True,
+        )
+
+        # Collect all successful signatures with gateway labels
+        sigs = {}
+        if not isinstance(ams_result, Exception):
+            sigs[ams_result] = "AMS"
+        if not isinstance(helius_fr_result, Exception):
+            sigs[helius_fr_result] = "helius_FR"
+        if not isinstance(helius_ams_result, Exception):
+            sigs[helius_ams_result] = "helius_AMS"
+
+        if not sigs:
+            raise RuntimeError(f"All paths failed: AMS={ams_result} helius_FR={helius_fr_result} helius_AMS={helius_ams_result}")
+
+        all_sigs = list(sigs.keys())
+        log.info("BUY  submitted  sigs=%s  gateways=%s  total_time=%.3fs",
+                 [s[:16] for s in all_sigs], list(sigs.values()),
+                 time.perf_counter() - t0)
+
+        # Poll all signatures — whichever lands first wins
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                result = await self._rpc({
+                    "method": "getSignatureStatuses",
+                    "params": [all_sigs, {"searchTransactionHistory": True}],
+                }, timeout=3)
+                statuses = result.get("value", [])
+                for idx, status in enumerate(statuses):
+                    if not status:
+                        continue
+                    winning_sig = all_sigs[idx]
+                    gateway = sigs[winning_sig]
+                    if status.get("err"):
+                        log.warning("BUY  sig %s (%s) failed on-chain: %s",
+                                    winning_sig[:16], gateway, status["err"])
+                        continue
+                    conf = status.get("confirmationStatus", "")
+                    if conf in ("processed", "confirmed", "finalized"):
+                        log.info("BUY  Landed via %s  sig=%s  (%s)", gateway, winning_sig[:16], conf)
+                        sig = winning_sig
+                        break
+                else:
+                    await asyncio.sleep(0.25)
+                    continue
+                break
+            except Exception:
+                await asyncio.sleep(0.25)
+                continue
+        else:
+            # Timeout — return first sig and let wait_for_order handle it
+            sig = all_sigs[0]
+            log.warning("BUY  No sig confirmed in 15s — returning %s (%s)", sig[:16], sigs[sig])
+
         log.info("BUY  nonce_at_submit=%s", blockhash[:16])
 
         # This nonce was already atomically consumed by _acquire_nonce().
@@ -1023,16 +1123,29 @@ class SolanaClient:
             else:
                 log.warning("SELL %s using cached creator_vault — drift risk", mint_str[:8])
 
-            log.debug("SELL %s  layout=%s accounts=%d",
-                      mint_str[:8], "old" if needs_bc_v2 else "new",
-                      15 if needs_bc_v2 else 16)
-            tx_bytes = self._build_local_sell_tx(
-                mint_str, token_accounts, raw_balance, blockhash, needs_bc_v2
+            # Build both layout variants — only one can land (same token balance)
+            tx_old = self._build_local_sell_tx(
+                mint_str, token_accounts, raw_balance, blockhash, True
             )
-            tx_b64 = base64.b64encode(tx_bytes).decode()
-            sig    = await self._send_via_rpc(tx_b64)
-            log.info("SELL submitted (local)  sig=%s", sig)
-            return sig, tx_b64, needs_bc_v2
+            tx_new = self._build_local_sell_tx(
+                mint_str, token_accounts, raw_balance, blockhash, False
+            )
+
+            # Submit both layouts in parallel — whichever lands wins
+            sig_old, sig_new = await asyncio.gather(
+                self._send_via_rpc(base64.b64encode(tx_old).decode()),
+                self._send_via_rpc(base64.b64encode(tx_new).decode()),
+                return_exceptions=True,
+            )
+
+            # Return whichever succeeded
+            if not isinstance(sig_old, Exception):
+                log.info("SELL submitted (old layout)  sig=%s", sig_old[:16])
+                return sig_old, base64.b64encode(tx_old).decode(), True
+            if not isinstance(sig_new, Exception):
+                log.info("SELL submitted (new layout)  sig=%s", sig_new[:16])
+                return sig_new, base64.b64encode(tx_new).decode(), False
+            raise RuntimeError(f"Both sell layouts failed: old={sig_old} new={sig_new}")
 
         raise RuntimeError(f"no token_accounts for sell of {mint_str}")
 

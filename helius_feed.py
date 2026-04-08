@@ -116,13 +116,13 @@ class HeliusAccountFeed:
     # ------------------------------------------------------------------
 
     async def _watchdog(self):
-        """Force reconnection if no messages for 30s."""
+        """Force reconnection if no messages for 60s."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
             if self._ws is None:
                 continue
             elapsed = time.time() - self._last_msg
-            if elapsed > 30:
+            if elapsed > 60:
                 log.warning("Helius silent for %.0fs — forcing reconnect", elapsed)
                 try:
                     await self._ws.close()
@@ -163,13 +163,13 @@ class HeliusAccountFeed:
 
             except (websockets.exceptions.ConnectionClosed, OSError,
                     asyncio.TimeoutError) as exc:
-                log.warning("Helius disconnected (%s). Reconnecting in 0.3s…", exc)
+                log.warning("Helius disconnected (%s). Reconnecting in 2s…", exc)
                 self._ws = None
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(2)
             except Exception as exc:
                 log.error("Helius WS error: %s", exc, exc_info=True)
                 self._ws = None
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(5)
 
     def _handle(self, msg: dict):
         # Subscription confirmation: {"id": rid, "result": <sub_id int>}

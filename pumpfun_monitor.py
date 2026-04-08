@@ -266,13 +266,13 @@ class PumpFunMonitor:
     # ------------------------------------------------------------------
 
     async def _pp_watchdog(self):
-        """Force PumpPortal reconnection if no messages for 30s."""
+        """Force PumpPortal reconnection if no messages for 60s."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
             if self._ws is None:
                 continue
             elapsed = time.time() - self._last_pp_msg
-            if elapsed > 30:
+            if elapsed > 60:
                 log.warning("PumpPortal silent for %.0fs — forcing reconnect", elapsed)
                 try:
                     await self._ws.close()
@@ -321,13 +321,13 @@ class PumpFunMonitor:
 
             except (websockets.exceptions.ConnectionClosed, OSError,
                     asyncio.TimeoutError) as exc:
-                log.warning("PumpPortal disconnected (%s). Reconnecting in 0.3s…", exc)
+                log.warning("PumpPortal disconnected (%s). Reconnecting in 2s…", exc)
                 self._ws = None
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(2)
             except Exception as exc:
                 log.error("PumpPortal error: %s", exc, exc_info=True)
                 self._ws = None
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(5)
 
     async def _on_new_token(self, msg: dict):
         mint = msg.get("mint")
