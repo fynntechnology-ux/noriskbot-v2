@@ -42,6 +42,12 @@ ASTRALANE_URL:       str = f"https://fr.gateway.astralane.io/iris?api-key={ASTRA
 ASTRALANE_AMS_URL:   str = f"http://ams.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
 ASTRALANE_AMS_TIP_LAMPORTS: int = int(os.getenv("ASTRALANE_AMS_TIP_LAMPORTS", "20000"))  # 0.00002 SOL
 
+# Dedicated read RPC for getAccountInfo calls (bonding curve, nonce).
+# Keeps heavy read traffic off Helius so tx-submission quota is never starved.
+# Falls back to HELIUS_RPC_HTTP if not set.
+_read_rpc_raw:   str = os.getenv("READ_RPC_HTTP", "")
+READ_RPC_HTTP:   str = _read_rpc_raw if _read_rpc_raw else HELIUS_RPC_HTTP
+
 # Durable nonce (optional) — set NONCE_ACCOUNT to enable pre-signed txs
 NONCE_ACCOUNT:     str = os.getenv("NONCE_ACCOUNT", "")
 
