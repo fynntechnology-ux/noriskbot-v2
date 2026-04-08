@@ -994,16 +994,7 @@ class SolanaClient:
             tip_lamports = config.SENDER_TIP_LAMPORTS,
         )
 
-        # Build Helius fast tx (higher tip to different recipient)
-        tx_helius = self._build_local_buy_tx(
-            **build_kwargs,
-            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
-            tip_lamports = 600000,  # 0.0006 SOL
-            tip_recipient = _HELIUS_FAST_TIP,
-        )
-        tx_helius_b64 = base64.b64encode(tx_helius).decode()
-
-        # Build 0xslot tx (1M lamports tip to staked validator)
+        # Build 0xslot tx (1.5M lamports tip to staked validator)
         tx_0xslot = self._build_local_buy_tx(
             **build_kwargs,
             cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
@@ -1011,20 +1002,18 @@ class SolanaClient:
             tip_recipient = _0XSLOT_TIP,
         )
         tx_0xslot_b64 = base64.b64encode(tx_0xslot).decode()
+        tx_astralane_b64 = base64.b64encode(tx_astralane).decode()
 
         log.info(
-            "BUY  quad-path  AMS(tip=%d) helius_AMS(tip=600000) getblock(tip=600000) 0xslot(tip=1500000)",
+            "BUY  tri-path  AMS(tip=%d) 0xslot(tip=1500000) erpc",
             config.SENDER_TIP_LAMPORTS,
         )
 
-        # Submit to all gateways in parallel (HTTP for 0xslot — faster than HTTPS)
-        ams_result, helius_ams_result, getblock_result, slot_de1_result, slot_de2_result, erpc_result = await asyncio.gather(
-            self._send_via_sender(base64.b64encode(tx_astralane).decode(), config.ASTRALANE_AMS_URL),
-            self._send_via_sender(tx_helius_b64, "http://ams-sender.helius-rpc.com/fast"),
-            self._send_via_sender(tx_helius_b64, "https://go.getblock.io/8c82122595b643aab1fdfc6de55060d6"),
-            self._send_via_sender(tx_0xslot_b64, "http://de1.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
+        # Submit to 3 working gateways in parallel (same tx)
+        ams_result, slot_de2_result, erpc_result = await asyncio.gather(
+            self._send_via_sender(tx_astralane_b64, config.ASTRALANE_AMS_URL),
             self._send_via_sender(tx_0xslot_b64, "http://de2.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
-            self._send_via_sender(tx_helius_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
+            self._send_via_sender(tx_astralane_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
             return_exceptions=True,
         )
 
@@ -1032,12 +1021,6 @@ class SolanaClient:
         sigs = {}
         if not isinstance(ams_result, Exception):
             sigs[ams_result] = "AMS"
-        if not isinstance(helius_ams_result, Exception):
-            sigs[helius_ams_result] = "helius_AMS"
-        if not isinstance(getblock_result, Exception):
-            sigs[getblock_result] = "getblock"
-        if not isinstance(slot_de1_result, Exception):
-            sigs[slot_de1_result] = "0xslot_de1"
         if not isinstance(slot_de2_result, Exception):
             sigs[slot_de2_result] = "0xslot_de2"
         if not isinstance(erpc_result, Exception):
