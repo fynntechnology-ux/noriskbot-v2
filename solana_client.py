@@ -994,7 +994,7 @@ class SolanaClient:
             tip_lamports = config.SENDER_TIP_LAMPORTS,
         )
 
-        # Build 0xslot tx (1.5M lamports tip to staked validator)
+        # Build 0xslot tx (1M lamports tip)
         tx_0xslot = self._build_local_buy_tx(
             **build_kwargs,
             cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
@@ -1004,16 +1004,24 @@ class SolanaClient:
         tx_0xslot_b64 = base64.b64encode(tx_0xslot).decode()
         tx_astralane_b64 = base64.b64encode(tx_astralane).decode()
 
+        # Build ERpc tx (3x priority fee, no tip — ERPC doesn't use tips)
+        tx_erpc = self._build_local_buy_tx(
+            **build_kwargs,
+            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE * 3,
+            tip_lamports = 0,
+        )
+        tx_erpc_b64 = base64.b64encode(tx_erpc).decode()
+
         log.info(
             "BUY  tri-path  AMS(tip=%d) 0xslot(tip=1500000) erpc",
             config.SENDER_TIP_LAMPORTS,
         )
 
-        # Submit to 3 working gateways in parallel (same tx)
+        # Submit to 3 working gateways in parallel
         ams_result, slot_de2_result, erpc_result = await asyncio.gather(
             self._send_via_sender(tx_astralane_b64, config.ASTRALANE_AMS_URL),
             self._send_via_sender(tx_0xslot_b64, "http://de2.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
-            self._send_via_sender(tx_astralane_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
+            self._send_via_sender(tx_erpc_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
             return_exceptions=True,
         )
 

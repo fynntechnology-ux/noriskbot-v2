@@ -141,7 +141,9 @@ class PositionManager:
         poll_task = asyncio.create_task(_poll_stop())
 
         # Race: trailing stop vs hold timer
-        hold_task = asyncio.create_task(asyncio.sleep(config.HOLD_TIME_SECONDS))
+        # Shorter hold (23s) if peak bonding was low (<2% = low market cap)
+        hold_seconds = 23 if pos.peak_bonding < 2.0 else config.HOLD_TIME_SECONDS
+        hold_task = asyncio.create_task(asyncio.sleep(hold_seconds))
         stop_task = asyncio.create_task(stop_event.wait())
 
         done, pending = await asyncio.wait(
