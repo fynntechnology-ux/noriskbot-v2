@@ -856,21 +856,7 @@ class SolanaClient:
             lamports=effective_tip,
         ))
 
-        instructions = []
-        if config.NONCE_ACCOUNT:
-            nonce_acct = Pubkey.from_string(config.NONCE_ACCOUNT)
-            ix_advance = Instruction(
-                program_id=_SYSTEM_PROGRAM,
-                accounts=[
-                    AccountMeta(nonce_acct,   False, True),
-                    AccountMeta(_SYSVAR_RECENT_BLOCKHASHES, False, False),
-                    AccountMeta(self._pubkey, True,  False),
-                ],
-                data=bytes([4, 0, 0, 0]),
-            )
-            instructions.append(ix_advance)
-
-        instructions.extend([ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip])
+        instructions = [ix_cu_limit, ix_cu_price, ix_create, ix_init, ix_buy, ix_tip]
 
         msg = Message.new_with_blockhash(
             instructions,
@@ -980,20 +966,15 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fast path: only fetch nonce. Reserves from signal, vault from prefetch.
+        # Fast path: use cached blockhash (refreshed every 200ms). No nonce needed.
         t_fetch_start = time.perf_counter()
-        if not config.NONCE_ACCOUNT:
-            raise RuntimeError("buy requires NONCE_ACCOUNT — set it in .env")
 
         if vsol_lamports is None or not vtoken_raw:
             raise RuntimeError("missing reserves from signal — skipping")
 
-        try:
-            blockhash = await asyncio.wait_for(self._acquire_nonce(), timeout=3.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("nonce fetch timed out after 3s — skipping")
+        blockhash = await self._fresh_blockhash()
         t_fetch = time.perf_counter() - t_fetch_start
-        log.debug("Fetch latency: %.3fs (nonce only)", t_fetch)
+        log.debug("Fetch latency: %.3fs (blockhash)", t_fetch)
         log.debug("BUY using signal reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
 
         build_kwargs = dict(
@@ -1107,10 +1088,6 @@ class SolanaClient:
             log.warning("BUY  No sig confirmed in 15s — returning %s (%s)", sig[:16], sigs[sig])
 
         log.info("BUY  nonce_at_submit=%s", blockhash[:16])
-
-        # This nonce was already atomically consumed by _acquire_nonce().
-        # Start background refill for the next buy, but never allow reuse.
-        self._ensure_nonce_replenish()
         return sig
 
     async def _fetch_ata_balance(self, mint_str: str) -> int:
