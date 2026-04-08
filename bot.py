@@ -91,6 +91,10 @@ class PumpSnipeBot:
             actual = result.get("sol_spent", 0)
             if actual > 0 and mint in self._state.positions:
                 self._state.positions[mint].sol_spent = actual
+            # Record gateway hit
+            gw = self._solana._last_buy_gateway
+            if gw:
+                self._state.gateway_hits[gw] = self._state.gateway_hits.get(gw, 0) + 1
         except Exception as exc:
             self._state.log("error", mint, symbol, f"buy failed on-chain: {exc}")
             log.error("Buy failed on-chain for %s: %s", mint, exc)

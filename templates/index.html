@@ -244,6 +244,7 @@
     <div class="stat"><div class="label">SOL Back</div><div class="value" id="s-returned">0.0000</div></div>
     <div class="stat"><div class="label">P&amp;L</div><div class="value" id="s-pnl">+0.0000</div></div>
     <div class="stat"><div class="label">Sell Fails</div><div class="value" id="s-fails">0</div></div>
+    <div class="stat"><div class="label">Gateways</div><div class="value cyan" id="s-gateways" style="font-size:10px;white-space:nowrap">-</div></div>
   </div>
   <div id="conn-dot" title="WebSocket connection"></div>
 </div>
@@ -376,6 +377,14 @@ function applyStats(d) {
   document.getElementById('s-spent').textContent     = d.sol_spent.toFixed(4);
   document.getElementById('s-returned').textContent  = d.sol_returned.toFixed(4);
   document.getElementById('s-fails').textContent     = d.sell_failures;
+
+  // Gateway hits
+  if (d.gateway_hits && Object.keys(d.gateway_hits).length) {
+    const parts = Object.entries(d.gateway_hits)
+      .sort((a,b) => b[1] - a[1])
+      .map(([k,v]) => `${k}:${v}`);
+    document.getElementById('s-gateways').textContent = parts.join(' ');
+  }
 
   const pnlEl = document.getElementById('s-pnl');
   pnlEl.textContent = (d.pnl_sol >= 0 ? '+' : '') + d.pnl_sol.toFixed(4);

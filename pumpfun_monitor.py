@@ -134,31 +134,46 @@ class PumpFunMonitor:
         vsol_raw = msg.get("vSolInBondingCurve")
         if vsol_raw is None:
             return
-        # Also capture vtoken so local build doesn't fall back when only
-        # the PumpPortal feed fires before the Helius subscription arrives
+        # PumpPortal sends vtoken as JS float — truncates large numbers.
+        # If vtoken < 10^12 it's definitely truncated (real is ~10^15).
+        # Only use it if Helius hasn't provided a value yet.
         vtoken_raw = msg.get("vTokensInBondingCurve")
         if vtoken_raw is not None and watch.vtoken_raw is None:
-            watch.vtoken_raw = int(vtoken_raw)
+            v = int(vtoken_raw)
+            if v > 1_000_000_000_000:  # >10^12 = likely correct
+                watch.vtoken_raw = v
+            # else: skip truncated value, wait for Helius
         self._process_vsol(watch, float(vsol_raw))
 
     async def _prefetch_accounts(self, mint: str):
         """
         Call PumpPortal trade-local for a dummy buy to obtain the static account
-        list for this token, then cache it on the TokenWatch.
-
-        If the create event provided a creator_wallet, derive creator_vault PDA
-        from it (authoritative). Otherwise fall back to static[4].
+        list for this token, then derive creator_vault on-chain via Alchemy.
         """
         watch = self._watching.get(mint)
         if not watch:
             return
         try:
-            accounts = await self._solana_client.prefetch_token_accounts(
-                mint, creator_wallet=watch.creator_wallet,
-            )
-            if watch and accounts:
-                watch.accounts = accounts
-                log.debug("%s  accounts prefetched", mint[:8])
+            accounts = await self._solana_client.prefetch_token_accounts(mint)
+            if not (watch and accounts):
+                return
+
+            # Derive vault on-chain via Alchemy (replaces PumpPortal vault)
+            bc_addr = accounts.bonding_curve
+            derived_vault = await self._solana_client._derive_creator_vault(mint, bc_addr)
+            if derived_vault:
+                from solana_client import TokenAccounts
+                accounts = TokenAccounts(
+                    assoc_user          = accounts.assoc_user,
+                    bonding_curve       = accounts.bonding_curve,
+                    assoc_bonding_curve = accounts.assoc_bonding_curve,
+                    creator_vault       = derived_vault,
+                    pump_const1         = accounts.pump_const1,
+                    unk16               = accounts.unk16,
+                )
+
+            watch.accounts = accounts
+            log.debug("%s  accounts prefetched (vault=%s)", mint[:8], accounts.creator_vault[:12])
         except WrongProgramError:
             # Unsupported program — stop watching immediately
             if mint in self._watching:
@@ -221,6 +236,15 @@ class PumpFunMonitor:
     async def _fire(self, watch: TokenWatch, age: float, peak_pct: float):
         # Use watch.vsol at fire time — fresher than signal-moment snapshot
         # since Helius may have updated it between signal detection and here
+
+        # Fallback vtoken: if Helius is dead and PumpPortal truncated the value,
+        # use the known pump.fun initial vtoken reserves
+        vtoken = watch.vtoken_raw
+        if vtoken is None or vtoken < 1_000_000_000_000:
+            vtoken = 1_073_000_000_000_000  # pump.fun initial vtoken (10^15)
+            log.warning("vtoken_raw truncated or missing (%s) — using fallback for %s",
+                        watch.vtoken_raw, watch.mint[:8])
+
         await self._on_signal({
             "mint":             watch.mint,
             "symbol":           watch.symbol,
@@ -228,9 +252,8 @@ class PumpFunMonitor:
             "bonding_pct":      0.0,
             "peak_bonding_pct": peak_pct,
             "age_seconds":      age,
-            # Per-token data for local tx building (may be None if prefetch lost race)
             "vsol_lamports":    int(watch.vsol * 1e9),
-            "vtoken_raw":       watch.vtoken_raw,
+            "vtoken_raw":       vtoken,
             "token_accounts":   watch.accounts,
         })
 

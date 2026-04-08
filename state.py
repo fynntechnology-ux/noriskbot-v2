@@ -67,6 +67,7 @@ class BotState:
         self.total_sol_spent: float = 0.0
         self.total_sol_returned: float = 0.0
         self.sell_failures: int = 0
+        self.gateway_hits: dict[str, int] = {}  # gateway_name → count
 
     # ------------------------------------------------------------------
     # Write helpers (called from bot / monitor / position manager)

@@ -54,6 +54,7 @@ def serialize(state: BotState) -> dict:
         "sell_failures":     state.sell_failures,
         "open_count":        len(state.open_positions),
         "tracking_count":    len(state.tracked),
+        "gateway_hits":      state.gateway_hits,
 
         "open_positions": [
             {

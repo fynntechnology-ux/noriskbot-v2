@@ -15,6 +15,7 @@ Fallback (if prefetch unavailable): use PumpPortal tx as before.
 
 import asyncio
 import base64
+import json
 import struct
 import time
 from dataclasses import dataclass
@@ -46,6 +47,8 @@ _SYSTEM_PROGRAM   = Pubkey.from_string("11111111111111111111111111111111")
 # Tip recipients
 _ASTRALANE_TIP     = Pubkey.from_string("AStrAJv2RN2hKCHxwUMtqmSxgdcNZbihCwc1mCSnG83W")
 _HELIUS_FAST_TIP   = Pubkey.from_string("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta")
+_JITO_TIP          = Pubkey.from_string("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5")
+_0XSLOT_TIP        = Pubkey.from_string("Eb2KpSC8uMt9GmzyAEm5Eb1AAAgTjRaXWFjKyFXHZxF3")
 
 # Nonce account sysvar required by AdvanceNonceAccount instruction
 _SYSVAR_RECENT_BLOCKHASHES = Pubkey.from_string("SysvarRecentB1ockHashes11111111111111111111")
@@ -103,6 +106,7 @@ class SolanaClient:
         self._last_consumed_nonce    = ""   # track to detect reuse
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
+        self._last_buy_gateway       = ""   # which gateway landed the last buy
         log.info("Wallet: %s", self._pubkey)
 
     async def close(self):
@@ -304,8 +308,28 @@ class SolanaClient:
             raise RuntimeError(f"Astralane unexpected response: {data}")
         return data["result"]
 
+    async def _send_via_jito(self, tx_b64: str) -> str:
+        """Submit tx to Jito block engine via JSON-RPC sendTransaction."""
+        async with self._session.post(
+            "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [tx_b64, {"encoding": "base64"}],
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        log.debug("Jito response (status=%d): %s", resp.status, data)
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(f"Jito error: {data['error']}")
+        if isinstance(data, dict) and "result" in data:
+            return data["result"]
+        raise RuntimeError(f"Jito unexpected response: {data}")
+
     async def _send_via_astralane(self, tx_bytes: bytes) -> str:
-        """Submit raw tx bytes to Astralane with Bearer auth (used for nonce txs)."""
         encoded = base64.b64encode(tx_bytes).decode()
         headers = {
             "Content-Type":  "application/json",
@@ -332,25 +356,35 @@ class SolanaClient:
         return result
 
     async def _fetch_nonce_from_chain(self) -> str:
-        """Read the durable nonce value directly from the nonce account on-chain."""
-        result = await self._rpc({
-            "method": "getAccountInfo",
-            "params": [config.NONCE_ACCOUNT, {"encoding": "base64", "commitment": "processed"}],
-        }, timeout=3)
-        data_b64 = (result.get("value") or {}).get("data", [None])[0]
+        """Read the durable nonce value directly from the nonce account on-chain.
+        Uses ERPC for lowest latency."""
+        async with self._session.post(
+            "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6",
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getAccountInfo",
+                "params": [config.NONCE_ACCOUNT, {"encoding": "base64", "commitment": "processed"}],
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            raw = await resp.read()
+            data = json.loads(raw)
+        data_b64 = (((data or {}).get("result") or {}).get("value") or {}).get("data", [None])[0]
         if not data_b64:
             raise RuntimeError("Nonce account not found or empty")
-        data = base64.b64decode(data_b64)
-        if len(data) < 80:
-            raise RuntimeError(f"Nonce account data too short: {len(data)} bytes")
-        return str(Hash.from_bytes(data[40:72]))
+        data_bytes = base64.b64decode(data_b64)
+        if len(data_bytes) < 80:
+            raise RuntimeError(f"Nonce account data too short: {len(data_bytes)} bytes")
+        return str(Hash.from_bytes(data_bytes[40:72]))
 
     async def _derive_creator_vault(self, mint_str: str, bc_addr: str) -> str | None:
         """Derive creator_vault PDA directly from bonding curve data (no PumpPortal round-trip).
-        Uses GetBlock endpoint to spread load off Helius."""
+        Creator pubkey at bytes [49:81] in bonding curve account layout.
+        Uses Alchemy to spread load off Helius."""
         try:
             async with self._session.post(
-                "https://go.getblock.io/8c82122595b643aab1fdfc6de55060d6",
+                "https://solana-mainnet.g.alchemy.com/v2/jpQYcpvnQ8XNbc0M6_-Vd",
                 json={
                     "jsonrpc": "2.0", "id": 1,
                     "method": "getAccountInfo",
@@ -359,14 +393,23 @@ class SolanaClient:
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=2),
             ) as resp:
-                data = await resp.json(content_type=None)
-            data_b64 = ((data or {}).get("result") or {}).get("value", {}).get("data", [None])[0]
+                raw = await resp.read()
+                data = json.loads(raw)
+            log.debug("_derive_creator_vault raw response: %s", raw[:200])
+            if not data or not isinstance(data, dict):
+                log.warning("_derive_creator_vault got non-dict: %s", type(data))
+                return None
+            result = data.get("result")
+            if not result:
+                log.warning("_derive_creator_vault no result: %s", data)
+                return None
+            data_b64 = (result.get("value") or {}).get("data", [None])[0]
             if not data_b64:
                 return None
-            data = base64.b64decode(data_b64)
-            if len(data) < 81:
+            data_bytes = base64.b64decode(data_b64)
+            if len(data_bytes) < 81:
                 return None
-            creator = Pubkey.from_bytes(data[49:81])
+            creator = Pubkey.from_bytes(data_bytes[49:81])
             if str(creator) == "11111111111111111111111111111111":
                 return None
             vault, _ = Pubkey.find_program_address(
@@ -937,42 +980,21 @@ class SolanaClient:
         if token_accounts is None:
             raise RuntimeError("missing prefetch data (token_accounts) — skipping")
 
-        # Fetch nonce (atomic — consumed immediately), fresh reserves, creator vault
+        # Fast path: only fetch nonce. Reserves from signal, vault from prefetch.
         t_fetch_start = time.perf_counter()
         if not config.NONCE_ACCOUNT:
             raise RuntimeError("buy requires NONCE_ACCOUNT — set it in .env")
+
+        if vsol_lamports is None or not vtoken_raw:
+            raise RuntimeError("missing reserves from signal — skipping")
+
         try:
-            blockhash, fresh_reserves, fresh_vault = await asyncio.wait_for(
-                asyncio.gather(
-                    self._acquire_nonce(),
-                    self._fetch_bc_reserves(token_accounts.bonding_curve),
-                    self._derive_creator_vault(mint_str, token_accounts.bonding_curve),
-                ),
-                timeout=5.0,
-            )
+            blockhash = await asyncio.wait_for(self._acquire_nonce(), timeout=3.0)
         except asyncio.TimeoutError:
-            raise RuntimeError("buy fetch timed out after 5s — skipping")
+            raise RuntimeError("nonce fetch timed out after 3s — skipping")
         t_fetch = time.perf_counter() - t_fetch_start
-        log.debug("Fetch latency: %.3fs (nonce+reserves+vault)", t_fetch)
-
-        if fresh_reserves:
-            vsol_lamports, vtoken_raw = fresh_reserves
-            log.debug("BUY using fresh reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
-        elif vsol_lamports is None or not vtoken_raw:
-            raise RuntimeError("missing reserves and fresh fetch failed — skipping")
-
-        # Apply fresh creator vault to eliminate drift
-        if fresh_vault:
-            token_accounts = TokenAccounts(
-                assoc_user          = token_accounts.assoc_user,
-                bonding_curve       = token_accounts.bonding_curve,
-                assoc_bonding_curve = token_accounts.assoc_bonding_curve,
-                creator_vault       = fresh_vault,
-                pump_const1         = token_accounts.pump_const1,
-                unk16               = token_accounts.unk16,
-            )
-        else:
-            log.warning("BUY %s using cached creator_vault — drift risk", mint_str[:8])
+        log.debug("Fetch latency: %.3fs (nonce only)", t_fetch)
+        log.debug("BUY using signal reserves: vsol=%.4f vtoken=%d", vsol_lamports/1e9, vtoken_raw)
 
         build_kwargs = dict(
             mint_str      = mint_str,
@@ -982,6 +1004,7 @@ class SolanaClient:
             vsol_lamports = vsol_lamports,
             blockhash     = blockhash,
         )
+        log.info("BUY  sol_lamports=%d  vtoken_raw=%d  vsol_lamports=%d", sol_lamports, vtoken_raw, vsol_lamports)
 
         # Build Astralane tx (standard tip)
         tx_astralane = self._build_local_buy_tx(
@@ -994,21 +1017,33 @@ class SolanaClient:
         tx_helius = self._build_local_buy_tx(
             **build_kwargs,
             cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
-            tip_lamports = 300000,  # 0.0003 SOL
+            tip_lamports = 600000,  # 0.0006 SOL
             tip_recipient = _HELIUS_FAST_TIP,
         )
         tx_helius_b64 = base64.b64encode(tx_helius).decode()
 
+        # Build 0xslot tx (1M lamports tip to staked validator)
+        tx_0xslot = self._build_local_buy_tx(
+            **build_kwargs,
+            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
+            tip_lamports = 1500000,  # 0.0015 SOL
+            tip_recipient = _0XSLOT_TIP,
+        )
+        tx_0xslot_b64 = base64.b64encode(tx_0xslot).decode()
+
         log.info(
-            "BUY  tri-path  AMS(tip=%d) helius_FR(tip=300000) helius_AMS(tip=300000)",
+            "BUY  quad-path  AMS(tip=%d) helius_AMS(tip=600000) getblock(tip=600000) 0xslot(tip=1500000)",
             config.SENDER_TIP_LAMPORTS,
         )
 
-        # Submit to all gateways in parallel
-        ams_result, helius_fr_result, helius_ams_result = await asyncio.gather(
+        # Submit to all gateways in parallel (HTTP for 0xslot — faster than HTTPS)
+        ams_result, helius_ams_result, getblock_result, slot_de1_result, slot_de2_result, erpc_result = await asyncio.gather(
             self._send_via_sender(base64.b64encode(tx_astralane).decode(), config.ASTRALANE_AMS_URL),
-            self._send_via_sender(tx_helius_b64, "http://fra-sender.helius-rpc.com/fast"),
             self._send_via_sender(tx_helius_b64, "http://ams-sender.helius-rpc.com/fast"),
+            self._send_via_sender(tx_helius_b64, "https://go.getblock.io/8c82122595b643aab1fdfc6de55060d6"),
+            self._send_via_sender(tx_0xslot_b64, "http://de1.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
+            self._send_via_sender(tx_0xslot_b64, "http://de2.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
+            self._send_via_sender(tx_helius_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
             return_exceptions=True,
         )
 
@@ -1016,13 +1051,19 @@ class SolanaClient:
         sigs = {}
         if not isinstance(ams_result, Exception):
             sigs[ams_result] = "AMS"
-        if not isinstance(helius_fr_result, Exception):
-            sigs[helius_fr_result] = "helius_FR"
         if not isinstance(helius_ams_result, Exception):
             sigs[helius_ams_result] = "helius_AMS"
+        if not isinstance(getblock_result, Exception):
+            sigs[getblock_result] = "getblock"
+        if not isinstance(slot_de1_result, Exception):
+            sigs[slot_de1_result] = "0xslot_de1"
+        if not isinstance(slot_de2_result, Exception):
+            sigs[slot_de2_result] = "0xslot_de2"
+        if not isinstance(erpc_result, Exception):
+            sigs[erpc_result] = "erpc"
 
         if not sigs:
-            raise RuntimeError(f"All paths failed: AMS={ams_result} helius_FR={helius_fr_result} helius_AMS={helius_ams_result}")
+            raise RuntimeError(f"All paths failed")
 
         all_sigs = list(sigs.keys())
         log.info("BUY  submitted  sigs=%s  gateways=%s  total_time=%.3fs",
@@ -1051,6 +1092,7 @@ class SolanaClient:
                     if conf in ("processed", "confirmed", "finalized"):
                         log.info("BUY  Landed via %s  sig=%s  (%s)", gateway, winning_sig[:16], conf)
                         sig = winning_sig
+                        self._last_buy_gateway = gateway
                         break
                 else:
                     await asyncio.sleep(0.25)
@@ -1188,6 +1230,17 @@ class SolanaClient:
                         continue
                     found_sig = all_sigs[idx]
                     if status.get("err"):
+                        # For SELLs: tx may land with error but still return SOL
+                        if label == "SELL":
+                            try:
+                                sol_back = await self._get_sol_received(found_sig)
+                                if sol_back > 0:
+                                    log.warning("TX %s… SELL landed with error but returned %d lamports — treating as success",
+                                                found_sig[:16], sol_back)
+                                    log.info("TX %s… %s  (confirmed-with-error)", found_sig[:16], label)
+                                    return {"sig": found_sig, "status": "confirmed", "output_amount": sol_back, "sol_spent": 0}
+                            except Exception:
+                                pass
                         raise RuntimeError(
                             f"TX {found_sig[:16]} {label} failed: {status['err']}"
                         )
