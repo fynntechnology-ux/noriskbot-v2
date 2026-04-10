@@ -16,6 +16,7 @@ Fallback (if prefetch unavailable): use PumpPortal tx as before.
 import asyncio
 import base64
 import json
+from tpu_sender import send_via_tpu
 import struct
 import time
 from dataclasses import dataclass
@@ -106,6 +107,7 @@ class SolanaClient:
         self._last_consumed_nonce    = ""   # track to detect reuse
         self._pump_alt               = None   # AddressLookupTableAccount, set by warmup()
         self._wallet_balance_lamports: int = 0
+        self._cached_leader = None
         self._last_buy_gateway       = ""   # which gateway landed the last buy
         log.info("Wallet: %s", self._pubkey)
 
@@ -156,6 +158,7 @@ class SolanaClient:
         await asyncio.gather(_warm_helius(), _warm_pumpportal(), _prime_blockhash(),
                              _prime_nonce(), self._fetch_pump_alt(), self.refresh_balance())
         asyncio.create_task(self._blockhash_refresher())
+        asyncio.create_task(self._leader_refresh_loop())
 
     async def _fetch_pump_alt(self):
         """Fetch and parse the pump.fun Address Lookup Table once at startup."""
@@ -203,6 +206,68 @@ class SolanaClient:
             except Exception as exc:
                 log.warning("Blockhash refresh failed: %s", exc)
 
+    async def _get_next_leader(self) -> dict | None:
+        """Return cached next leader (refreshed in background every 5s)."""
+        return self._cached_leader
+
+    async def _leader_refresh_loop(self):
+        """Background task: refresh leader schedule every 5s. Finds best leader."""
+        while True:
+            try:
+                # Get current slot first
+                current_slot = await asyncio.wait_for(self._rpc({
+                    "method": "getSlot",
+                    "params": [{"commitment": "processed"}],
+                }, timeout=2), timeout=3)
+                if not isinstance(current_slot, int):
+                    current_slot = 0
+
+                # Query leaders from current slot
+                async with self._session.post(
+                    "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "getLeaderSlots", "params": [current_slot]},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=2),
+                ) as resp:
+                    raw = await resp.read()
+                    data = json.loads(raw)
+                result = (data or {}).get("result", {})
+                leaders = result.get("data", [])
+                if leaders:
+                    # Find the leader with lowest ping (prefer Frankfurt)
+                    best = None
+                    best_ping = 9999
+                    for leader in leaders:
+                        pings = leader.get("pingToLeaders", [])
+                        for p in pings:
+                            ms = p.get("ms", 9999)
+                            if ms < best_ping:
+                                best_ping = ms
+                                best = leader
+                    if best:
+                        fra_ping = None
+                        for p in best.get("pingToLeaders", []):
+                            if p.get("fromIp", "").startswith("185.191"):
+                                fra_ping = p.get("ms")
+                                break
+                        self._cached_leader = {
+                            "identity": best.get("identity", ""),
+                            "slot": int(best.get("slot", 0)),
+                            "region": best.get("leaderRegion", "unknown"),
+                            "city": best.get("leaderCity", "Unknown"),
+                            "fra_ping": fra_ping,
+                            "tpu_ip": best.get("ipAddress", ""),
+                            "tpu_port": best.get("tpuPort", 0),         # UDP
+                            "tpu_quic_port": best.get("tpuQuicPort", 0), # QUIC
+                        }
+                        log.debug("Leader refreshed: %s (%s) fra=%s",
+                                  self._cached_leader.get("city", "?"),
+                                  self._cached_leader.get("region", "?"),
+                                  f"{fra_ping}ms" if fra_ping else "?")
+            except Exception as exc:
+                log.debug("Leader refresh failed: %s", exc)
+            await asyncio.sleep(5)
+
     async def _fresh_blockhash(self) -> str:
         """Return cached blockhash if ≤400ms old, else fetch synchronously."""
         if time.time() - self._blockhash_ts <= 0.6 and self._blockhash:
@@ -218,7 +283,7 @@ class SolanaClient:
     async def _rpc(self, body: dict, timeout: float = 5.0) -> dict:
         body.setdefault("jsonrpc", "2.0")
         body.setdefault("id", 1)
-        urls = [config.HELIUS_RPC_HTTP, config.FALLBACK_RPC_HTTP] if hasattr(config, "FALLBACK_RPC_HTTP") else [config.HELIUS_RPC_HTTP]
+        urls = [config.HELIUS_RPC_HTTP, config.FALLBACK_RPC_HTTP]
         last_exc = None
         for url in urls:
             try:
@@ -325,7 +390,7 @@ class SolanaClient:
         log.debug("Jito response (status=%d): %s", resp.status, data)
         if isinstance(data, dict) and "error" in data:
             raise RuntimeError(f"Jito error: {data['error']}")
-        if isinstance(data, dict) and "result" in data:
+        if isinstance(data, dict) and data.get("result") and isinstance(data["result"], str):
             return data["result"]
         raise RuntimeError(f"Jito unexpected response: {data}")
 
@@ -379,30 +444,13 @@ class SolanaClient:
         return str(Hash.from_bytes(data_bytes[40:72]))
 
     async def _derive_creator_vault(self, mint_str: str, bc_addr: str) -> str | None:
-        """Derive creator_vault PDA directly from bonding curve data (no PumpPortal round-trip).
-        Creator pubkey at bytes [49:81] in bonding curve account layout.
-        Uses Alchemy to spread load off Helius."""
+        """Derive creator_vault PDA from bonding curve data via primary RPC.
+        Creator pubkey at bytes [49:81] in bonding curve account layout."""
         try:
-            async with self._session.post(
-                "https://solana-mainnet.g.alchemy.com/v2/jpQYcpvnQ8XNbc0M6_-Vd",
-                json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getAccountInfo",
-                    "params": [bc_addr, {"encoding": "base64", "commitment": "processed"}],
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=2),
-            ) as resp:
-                raw = await resp.read()
-                data = json.loads(raw)
-            log.debug("_derive_creator_vault raw response: %s", raw[:200])
-            if not data or not isinstance(data, dict):
-                log.warning("_derive_creator_vault got non-dict: %s", type(data))
-                return None
-            result = data.get("result")
-            if not result:
-                log.warning("_derive_creator_vault no result: %s", data)
-                return None
+            result = await self._rpc({
+                "method": "getAccountInfo",
+                "params": [bc_addr, {"encoding": "base64", "commitment": "processed"}],
+            }, timeout=2)
             data_b64 = (result.get("value") or {}).get("data", [None])[0]
             if not data_b64:
                 return None
@@ -985,7 +1033,22 @@ class SolanaClient:
             vsol_lamports = vsol_lamports,
             blockhash     = blockhash,
         )
-        log.info("BUY  sol_lamports=%d  vtoken_raw=%d  vsol_lamports=%d", sol_lamports, vtoken_raw, vsol_lamports)
+
+        # Query next leader for zero-block optimization
+        leader = self._cached_leader  # instant — from background refresh
+
+        # Slot-aware submission
+        if leader:
+            fra = leader.get("fra_ping")
+            city = leader.get("city", "?")
+            region = leader.get("region", "?")
+            if fra is not None and fra < 5:
+                # Frankfurt leader — submit via TPU for zero-block
+                log.info("BUY  FRANKFURT leader (%s/%s) fra=%.3fms — TPU priority",
+                         city, region, fra)
+            else:
+                log.info("BUY  leader: %s/%s fra=%s",
+                         city, region, f"{fra}ms" if fra else "?")
 
         # Build Astralane tx (standard tip)
         tx_astralane = self._build_local_buy_tx(
@@ -994,14 +1057,6 @@ class SolanaClient:
             tip_lamports = config.SENDER_TIP_LAMPORTS,
         )
 
-        # Build 0xslot tx (1M lamports tip)
-        tx_0xslot = self._build_local_buy_tx(
-            **build_kwargs,
-            cu_price     = config.IDEAL_HIGH_FEE_CU_PRICE,
-            tip_lamports = 1500000,  # 0.0015 SOL
-            tip_recipient = _0XSLOT_TIP,
-        )
-        tx_0xslot_b64 = base64.b64encode(tx_0xslot).decode()
         tx_astralane_b64 = base64.b64encode(tx_astralane).decode()
 
         # Build ERpc tx (3x priority fee, no tip — ERPC doesn't use tips)
@@ -1013,26 +1068,36 @@ class SolanaClient:
         tx_erpc_b64 = base64.b64encode(tx_erpc).decode()
 
         log.info(
-            "BUY  tri-path  AMS(tip=%d) 0xslot(tip=1500000) erpc",
+            "BUY  dual-path  AMS(tip=%d) erpc  leader=%s",
             config.SENDER_TIP_LAMPORTS,
+            f"{leader.get('city','?')}/{leader.get('region','?')}" if leader else "none",
         )
 
-        # Submit to 3 working gateways in parallel
-        ams_result, slot_de2_result, erpc_result = await asyncio.gather(
+        # Submit to gateways in parallel
+        tasks = [
+            self._send_via_sender(tx_astralane_b64, config.ASTRALANE_URL),
             self._send_via_sender(tx_astralane_b64, config.ASTRALANE_AMS_URL),
-            self._send_via_sender(tx_0xslot_b64, "http://de2.0slot.trade/?api-key=fbdbeefcb42b4740980bdd040f070851"),
             self._send_via_sender(tx_erpc_b64, "https://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"),
-            return_exceptions=True,
-        )
+        ]
+        task_labels = ["FR", "AMS", "erpc"]
 
-        # Collect all successful signatures with gateway labels
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # TPU: fire-and-forget in background (don't block gather)
+        if leader and leader.get("tpu_ip") and leader.get("tpu_port"):
+            log.debug("TPU UDP: %s:%d", leader["tpu_ip"], leader["tpu_port"])
+            asyncio.create_task(send_via_tpu(tx_erpc, leader["tpu_ip"], leader["tpu_port"], "udp"))
+        if leader and leader.get("tpu_ip") and leader.get("tpu_quic_port"):
+            log.debug("TPU QUIC: %s:%d", leader["tpu_ip"], leader["tpu_quic_port"])
+            asyncio.create_task(send_via_tpu(tx_erpc, leader["tpu_ip"], leader["tpu_quic_port"], "quic"))
+
+        # Collect successful signatures (TPU is fire-and-forget, not a sig)
         sigs = {}
-        if not isinstance(ams_result, Exception):
-            sigs[ams_result] = "AMS"
-        if not isinstance(slot_de2_result, Exception):
-            sigs[slot_de2_result] = "0xslot_de2"
-        if not isinstance(erpc_result, Exception):
-            sigs[erpc_result] = "erpc"
+        for i, (result, label) in enumerate(zip(results, task_labels)):
+            if not isinstance(result, Exception) and not label.startswith("tpu"):
+                sigs[result] = label
+            elif label.startswith("tpu") and result:
+                log.debug("TPU direct send (%s): %s", label, result)
 
         if not sigs:
             raise RuntimeError(f"All paths failed")
@@ -1160,7 +1225,7 @@ class SolanaClient:
         raise RuntimeError(f"no token_accounts for sell of {mint_str}")
 
     async def wait_for_order(self, sig: str, label: str = "", tx_b64: str = "",
-                              needs_bc_v2: bool | None = None) -> dict:
+                              needs_bc_v2: bool | None = None, mint_str: str = "") -> dict:
         """Poll getSignatureStatuses until confirmed or timeout.
 
         sig may contain multiple signatures separated by "|" (primary|all_csv).
@@ -1207,6 +1272,12 @@ class SolanaClient:
                                                 found_sig[:16], sol_back)
                                     log.info("TX %s… %s  (confirmed-with-error)", found_sig[:16], label)
                                     return {"sig": found_sig, "status": "confirmed", "output_amount": sol_back, "sol_spent": 0}
+                                # Check if token balance is 0 (tokens sold despite error)
+                                remaining = await self._fetch_ata_balance(mint_str) if mint_str else 0
+                                if remaining == 0:
+                                    log.warning("TX %s… SELL error but token balance is 0 — tokens sold",
+                                                found_sig[:16])
+                                    return {"sig": found_sig, "status": "confirmed", "output_amount": 0, "sol_spent": 0}
                             except Exception:
                                 pass
                         raise RuntimeError(

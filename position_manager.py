@@ -169,7 +169,7 @@ class PositionManager:
             try:
                 order_id, tx_b64, needs_bc_v2 = await self._solana.sell_all(pos.mint, pos.token_accounts)
                 pos.sell_order_id = order_id
-                result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64, needs_bc_v2=needs_bc_v2)
+                result = await self._solana.wait_for_order(order_id, label="SELL", tx_b64=tx_b64, needs_bc_v2=needs_bc_v2, mint_str=pos.mint)
                 sol_back = float(result.get("output_amount", 0)) / config.LAMPORTS_PER_SOL
                 self._state.close_position(pos.mint, sol_back, success=True)
                 self._state.log("sell", pos.mint, pos.symbol,

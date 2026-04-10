@@ -29,7 +29,7 @@ import websockets
 from solders.pubkey import Pubkey
 
 import config
-from helius_feed import HeliusAccountFeed
+from geyser_feed import GeyserFeed
 from solana_client import TokenAccounts, WrongProgramError
 from state import BotState
 from logger import get_logger
@@ -98,7 +98,13 @@ class PumpFunMonitor:
         self._position_callbacks: dict[str, Callable[[float, int], None]] = {}
         self._ws             = None
         self._pending_unsubs: set[str]        = set()
-        self._helius         = HeliusAccountFeed(on_update=self._on_helius_update)
+        self._geyser = GeyserFeed(
+            on_account=self._on_geyser_update,
+            on_transaction=self._on_geyser_transaction,
+            on_slot=self._on_geyser_slot,
+        )
+        self._bc_to_mint = {}  # bc_addr hex -> mint
+        self._current_slot = 0
         self._last_pp_msg    = time.time()  # watchdog: last PumpPortal message time
 
     def register_position(self, mint: str, callback: Callable[[float, int], None]):
@@ -108,14 +114,18 @@ class PumpFunMonitor:
     def unregister_position(self, mint: str):
         """Called by PositionManager when position closes — unsubscribe Helius."""
         self._position_callbacks.pop(mint, None)
-        asyncio.create_task(self._helius.unsubscribe(mint))
+        asyncio.create_task(self._geyser.unsubscribe(mint))
 
     # ------------------------------------------------------------------
     # VSol processing — called by both PumpPortal trades and Helius feed
     # ------------------------------------------------------------------
 
-    def _on_helius_update(self, mint: str, vsol: float, vtoken_raw: int):
-        """Called by HeliusAccountFeed with parsed reserves."""
+    def _on_geyser_update(self, bc_pubkey_bytes: bytes, vsol: float, vtoken_raw: int):
+        """Called by GeyserFeed with parsed reserves + bonding curve pubkey bytes."""
+        bc_hex = bc_pubkey_bytes.hex() if isinstance(bc_pubkey_bytes, bytes) else ""
+        mint = self._bc_to_mint.get(bc_hex)
+        if not mint:
+            return
         # Feed open position price tracker if one exists
         cb = self._position_callbacks.get(mint)
         if cb:
@@ -123,7 +133,51 @@ class PumpFunMonitor:
         watch = self._watching.get(mint)
         if watch:
             watch.vtoken_raw = vtoken_raw
+            # If sell was detected via gRPC tx feed, process immediately
+            if getattr(watch, '_geyser_sell_detected', False):
+                watch._geyser_sell_detected = False
+                log.debug("Geyser fast signal for %s vsol=%.4f", mint[:8], vsol)
             self._process_vsol(watch, vsol)
+
+    def _on_geyser_transaction(self, tx_update, slot: int):
+        """Called when a pump.fun sell transaction is detected.
+        Match bonding curve accounts to tracked mints and fire signal."""
+        try:
+            txn = tx_update.transaction.transaction
+            msg = txn.message
+            for acc_bytes in msg.account_keys:
+                acc_hex = acc_bytes.hex() if isinstance(acc_bytes, bytes) else ""
+                if acc_hex in self._bc_to_mint:
+                    mint = self._bc_to_mint[acc_hex]
+                    watch = self._watching.get(mint)
+                    if watch and watch.vsol > 0:
+                        log.debug("Geyser sell detected on %s at slot=%d — fast signal", mint[:8], slot)
+                        # Fire signal immediately — the account update will confirm vSol
+                        asyncio.create_task(self._fire_if_dump(watch))
+        except Exception:
+            pass
+
+    async def _fire_if_dump(self, watch):
+        """Quick signal check from gRPC tx feed — fire if vSol is near zero."""
+        try:
+            if getattr(watch, '_fired', False):
+                return
+            age = time.time() - watch.t0
+            if age > config.MAX_TOKEN_AGE_SECONDS:
+                return
+            vsol = watch.vsol
+            if vsol - VSOL_INIT <= VSOL_MIN_DUMP and watch.peak_vsol - VSOL_INIT >= VSOL_MIN_ACTIVITY:
+                peak_pct = (watch.peak_vsol - VSOL_INIT) / VSOL_INIT * 100
+                log.info("SIGNAL (fast) %s  bonding≈0%%  peak=%.3f%%  age=%.1fs",
+                         watch.mint, peak_pct, age)
+                watch._fired = True
+                await self._fire(watch, age, peak_pct)
+        except Exception:
+            pass
+
+    def _on_geyser_slot(self, slot: int, status):
+        """Track current slot."""
+        self._current_slot = slot
 
     def _on_trade(self, msg: dict):
         """Called for PumpPortal tokenTrade events (backup feed)."""
@@ -179,7 +233,7 @@ class PumpFunMonitor:
             if mint in self._watching:
                 self._state.remove_tracked(mint)
                 del self._watching[mint]
-            await self._helius.unsubscribe(mint)
+            await self._geyser.unsubscribe(mint)
             log.debug("%s  wrong program — dropped", mint[:8])
         except Exception as exc:
             log.warning("prefetch_accounts failed for %s: %s", mint[:8], exc)
@@ -272,7 +326,7 @@ class PumpFunMonitor:
                 log.debug("%s  aged out — stopping watch", mint[:8])
                 self._state.remove_tracked(mint)
                 del self._watching[mint]
-                await self._helius.unsubscribe(mint)
+                await self._geyser.unsubscribe(mint)
                 self._pending_unsubs.add(mint)
                 if self._ws:
                     try:
@@ -305,7 +359,7 @@ class PumpFunMonitor:
 
     async def run(self):
         asyncio.create_task(self._reaper())
-        asyncio.create_task(self._helius.run())
+        asyncio.create_task(self._geyser.run())
         asyncio.create_task(self._pp_watchdog())
         log.info("Connecting to PumpPortal WebSocket…")
 
@@ -388,9 +442,18 @@ class PumpFunMonitor:
         # Subscribe Helius + PumpPortal trade in parallel
         bc_addr = msg.get("bondingCurveKey") or _derive_bonding_curve(mint)
 
+        # Map bonding curve pubkey hex to mint for gRPC updates
+        from solders.pubkey import Pubkey
+        try:
+            bc_hex = bytes(Pubkey.from_string(bc_addr)).hex()
+            self._bc_to_mint[bc_hex] = mint
+            log.debug("%s  bc_to_mint mapped: %s", mint[:8], bc_hex[:16])
+        except Exception as exc:
+            log.warning("bc_to_mint failed for %s: %s", mint[:8], exc)
+
         async def _helius_sub():
             try:
-                await self._helius.subscribe(mint, bc_addr)
+                await self._geyser.subscribe(mint, bc_addr)
             except Exception as exc:
                 log.warning("Helius subscribe failed for %s: %s", mint[:8], exc)
 

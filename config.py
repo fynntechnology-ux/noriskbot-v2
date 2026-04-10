@@ -34,8 +34,9 @@ IDEAL_HIGH_TIP_LAMPORTS:  int = int(os.getenv("IDEAL_HIGH_TIP_LAMPORTS",  "10000
 
 # RPC endpoints
 HELIUS_API_KEY:      str = os.environ["HELIUS_API_KEY"]
-HELIUS_RPC_HTTP:     str = f"https://beta.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-FALLBACK_RPC_HTTP:   str = os.getenv("FALLBACK_RPC_HTTP", "https://solana-mainnet.g.alchemy.com/v2/jpQYcpvnQ8XNbc0M6_-Vd")
+# Primary RPC: Alchemy (ERPC reserved for buys + gRPC feed)
+HELIUS_RPC_HTTP:     str = "https://solana-mainnet.g.alchemy.com/v2/jpQYcpvnQ8XNbc0M6_-Vd"
+FALLBACK_RPC_HTTP:   str = "https://go.getblock.io/8c82122595b643aab1fdfc6de55060d6"
 HELIUS_RPC_WS:       str = "wss://edge.erpc.global?api-key=d7a92b22-6847-425f-be3b-c327b339d2b6"
 ASTRALANE_API_KEY:   str = os.environ["ASTRALANE_API_KEY"]
 ASTRALANE_URL:       str = f"https://fr.gateway.astralane.io/iris?api-key={ASTRALANE_API_KEY}"
